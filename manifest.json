@@ -1,18 +1,39 @@
 {
   "manifest_version": 3,
-  "name": "Mohela Sync",
-  "version": "1.0",
-  "permissions": ["activeTab", "scripting", "storage"],
-  "host_permissions": ["https://myaccount.mohela.studentaid.gov/*"],
+  "name": "Monarch Sync",
+  "version": "2.0",
+  "description": "Manually sync Mohela student loans and Prudential annuity balances directly to Monarch Money.",
+  "permissions": ["activeTab", "scripting", "storage", "cookies", "declarativeNetRequestWithHostAccess"],
+  "host_permissions": [
+    "https://myaccount.mohela.studentaid.gov/*",
+    "https://www.prudential.com/mypru/myaccounts/*",
+    "https://myservice.prudential.com/*",
+    "*://*.monarch.com/*",
+    "*://*.monarchmoney.com/*"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      { "id": "monarch_rules", "enabled": true, "path": "monarch_rules.json" }
+    ]
+  },
   "background": {
     "service_worker": "background.js"
   },
-    "content_scripts": [
+  "content_scripts": [
     {
-        "matches": ["https://myaccount.mohela.studentaid.gov/*"],
-        "js": ["content.js"]
+      "matches": ["https://myaccount.mohela.studentaid.gov/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.prudential.com/mypru/myaccounts/*",
+        "https://myservice.prudential.com/*"
+      ],
+      "js": ["pru_content.js"],
+      "run_at": "document_idle"
     }
-    ],
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_icon": {

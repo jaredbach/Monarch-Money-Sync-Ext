@@ -1,0 +1,30 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "Origin",  "operation": "set", "value": "https://app.monarchmoney.com" },
+        { "header": "Referer", "operation": "set", "value": "https://app.monarchmoney.com/" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "https://api.monarchmoney.com/*"
+    }
+  },
+  {
+    "id": 2,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "Origin",  "operation": "set", "value": "https://app.monarch.com" },
+        { "header": "Referer", "operation": "set", "value": "https://app.monarch.com/" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "https://api.monarch.com/*"
+    }
+  }
+]

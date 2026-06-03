@@ -1,17 +1,333 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+  <meta charset="utf-8">
   <style>
-    body { font-family: sans-serif; width: 300px; padding: 10px; }
-    button { width: 100%; margin-top: 10px; }
+    /* ── Monarch brand palette (from monarch.com brand refresh) ─────────────
+       Primary dark:  #22201D  (warm near-black)
+       Primary orange:#FF692D  (Monarch brand orange)
+       Green accent:  #30A46C  (positive / synced)
+       Warm white:    #FEFCFB
+       Surface:       #F6F5F3
+       Muted text:    #84827F
+    ──────────────────────────────────────────────────────────────────────── */
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      width: 360px;
+      margin: 0;
+      padding: 0;
+      background: #f6f5f3;
+      color: #22201d;
+      font-size: 13px;
+    }
+
+    /* ── Brand header ────────────────────────────────────────────────────── */
+    .app-header {
+      background: #22201d;
+      color: #fefcfb;
+      padding: 11px 14px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand { display: flex; align-items: center; gap: 9px; }
+
+    .brand-icon {
+      width: 30px; height: 30px;
+      background: #ff692d;
+      border-radius: 7px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 17px; flex-shrink: 0;
+      color: #fefcfb;
+    }
+
+    .brand-text h1 {
+      margin: 0; font-size: 14px; font-weight: 700;
+      letter-spacing: 0.1px; line-height: 1.2;
+    }
+    .brand-text p {
+      margin: 0; font-size: 10px; color: #84827f;
+      letter-spacing: 0.3px; text-transform: uppercase;
+    }
+
+    #settings-toggle {
+      width: auto; margin: 0 0 0 auto; padding: 3px;
+      background: none; border: none; border-radius: 0;
+      color: #fefcfb; cursor: pointer; font-size: 16px;
+      line-height: 1; display: inline-flex; align-items: center;
+      justify-content: center; opacity: 0.82;
+      transition: opacity 0.12s;
+    }
+    #settings-toggle:hover { background: none; opacity: 1; }
+
+    /* ── Settings panel ──────────────────────────────────────────────────── */
+    #settings-panel {
+      display: none;
+      background: #fefcfb;
+      border-bottom: 1px solid #e4e1de;
+      padding: 12px 14px;
+    }
+
+    .settings-section-title {
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.7px; color: #84827f; margin: 0 0 8px;
+    }
+
+    #connection-status {
+      font-size: 12px; color: #363431;
+      margin-bottom: 8px;
+      display: flex; align-items: center; gap: 5px;
+    }
+
+    .settings-btn-row { display: flex; gap: 6px; margin-top: 6px; }
+    .settings-btn-row button { flex: 1; font-size: 12px; padding: 6px; }
+
+    #login-status {
+      margin-top: 6px; font-size: 11px; color: #84827f; min-height: 14px;
+    }
+
+    #mapping-section { margin-top: 12px; display: none; }
+
+    .mapping-group-label {
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.5px; color: #84827f; margin: 8px 0 4px;
+    }
+
+    .mapping-row {
+      display: flex; align-items: center; gap: 6px; margin-bottom: 5px;
+    }
+    .mapping-row .loan-label {
+      flex: 1; white-space: nowrap; overflow: hidden;
+      text-overflow: ellipsis; font-size: 11px; color: #363431;
+    }
+    .mapping-row select {
+      flex: 1.3; font-size: 11px; padding: 3px 4px;
+      border: 1px solid #dcd9d6; border-radius: 4px; background: #fefcfb;
+    }
+
+    /* ── Tab bar ─────────────────────────────────────────────────────────── */
+    .tab-bar {
+      display: flex;
+      background: #fefcfb;
+      border-bottom: 2px solid #e4e1de;
+      padding: 0 14px;
+    }
+
+    .tab-btn {
+      flex: 1; background: none; border: none;
+      border-bottom: 2px solid transparent; margin-bottom: -2px;
+      padding: 9px 4px 8px;
+      font-size: 12px; font-weight: 600; color: #84827f;
+      cursor: pointer; width: auto; margin-top: 0; border-radius: 0;
+      display: flex; align-items: center; justify-content: center; gap: 5px;
+      transition: color 0.12s, border-color 0.12s;
+    }
+    .tab-btn:hover { color: #22201d; background: none; }
+    .tab-btn.tab-active { color: #ff692d; border-bottom-color: #ff692d; background: none; }
+
+    .tab-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+
+    /* ── Source panels ───────────────────────────────────────────────────── */
+    .source-panel { padding: 10px 14px 6px; }
+
+    /* Quick-login strip at top of each panel */
+    .login-strip {
+      display: flex; align-items: center; justify-content: space-between;
+      background: #fff5f0; border: 1px solid #ffd7c4;
+      border-radius: 7px; padding: 7px 10px; margin-bottom: 8px;
+      font-size: 11px; color: #592c1d;
+    }
+    .login-strip span { line-height: 1.3; }
+    .login-strip a {
+      color: #ff692d; font-weight: 700; text-decoration: none;
+      white-space: nowrap; margin-left: 10px; font-size: 11px;
+    }
+    .login-strip a:hover { text-decoration: underline; }
+
+    .source-card {
+      background: #fefcfb; border: 1px solid #e4e1de;
+      border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+    }
+
+    .source-card-header {
+      display: flex; align-items: center;
+      justify-content: space-between; margin-bottom: 6px;
+    }
+
+    .source-badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.4px; padding: 2px 8px; border-radius: 20px;
+    }
+    .badge-mohela    { background: #fff7c2; color: #4f3422; border: 1px solid #f3d673; }
+    .badge-prudential{ background: #e6f6eb; color: #193b2d; border: 1px solid #8eceaa; }
+
+    .data-display {
+      font-size: 12px; color: #363431;
+      max-height: 160px; overflow-y: auto; line-height: 1.5;
+    }
+    .data-display b  { color: #22201d; }
+    .data-display hr { border: none; border-top: 1px solid #efecea; margin: 5px 0; }
+    .no-data         { color: #84827f; font-style: italic; font-size: 12px; }
+
+    /* ── Buttons ─────────────────────────────────────────────────────────── */
+    button {
+      width: 100%; margin-top: 6px; padding: 7px 10px;
+      cursor: pointer; border: 1px solid #dcd9d6;
+      border-radius: 6px; background: #fefcfb;
+      font-size: 12px; color: #363431; font-family: inherit;
+      transition: background 0.1s, border-color 0.1s;
+    }
+    button:hover:not(:disabled) { background: #f6f5f3; border-color: #bebbb8; }
+    button:disabled { opacity: 0.4; cursor: default; }
+
+    .btn-primary {
+      background: #ff692d !important;
+      color: #fefcfb !important;
+      border: none !important;
+      font-weight: 700; font-size: 13px;
+      padding: 9px; border-radius: 7px;
+    }
+    .btn-primary:hover:not(:disabled) { background: #f35b16 !important; }
+
+    .btn-sync {
+      background: #fff5f0; border-color: #ffb99c; color: #d64700;
+      font-weight: 600;
+    }
+    .btn-sync:hover:not(:disabled) { background: #ffe9de; }
+
+    .btn-export { font-size: 11px; color: #84827f; padding: 5px 10px; }
+
+    /* ── Bottom bar ──────────────────────────────────────────────────────── */
+    .bottom-bar {
+      background: #fefcfb; border-top: 1px solid #e4e1de;
+      padding: 10px 14px 12px;
+    }
+
+    #monarch-status {
+      margin-top: 6px; font-size: 11px; color: #84827f;
+      min-height: 14px; text-align: center; word-break: break-word;
+    }
+
+    .reset-row {
+      display: flex; justify-content: flex-end; margin-top: 4px;
+    }
+    #reset-sync-history {
+      width: auto; padding: 2px 6px; font-size: 10px;
+      color: #84827f; background: none; border: none;
+      cursor: pointer; margin: 0;
+    }
+    #reset-sync-history:hover { color: #363431; background: none; }
+
+    /* ── Misc ────────────────────────────────────────────────────────────── */
+    a { color: #ff692d; }
+    p { margin: 0 0 6px; }
+    .setting-hint { font-size: 11px; color: #84827f; margin: 4px 0 0; }
   </style>
 </head>
 <body>
-  <h2>Mohela Sync</h2>
-  <p id="balance">Loading...</p>
-  <button id="sync">Sync Now</button>
-  <button id="export">Export Balances</button>
-  <button id="export-transactions">Export Transactions</button>
+
+  <!-- ── Brand header ───────────────────────────────────────────────────── -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-icon">&#8635;</div>
+      <div class="brand-text">
+        <h1>Monarch Sync</h1>
+      </div>
+    </div>
+    <button id="settings-toggle" title="Monarch Money Settings">&#9881;&#65039;</button>
+  </header>
+
+  <!-- ── Settings panel ─────────────────────────────────────────────────── -->
+  <div id="settings-panel">
+    <p class="settings-section-title">Monarch Money Connection</p>
+    <div id="connection-status"><span>Checking&hellip;</span></div>
+    <div class="settings-btn-row">
+      <button id="open-monarch">Open Monarch Money</button>
+      <button id="btn-connect">Connect</button>
+    </div>
+    <p class="setting-hint">Log in at app.monarch.com, then click <strong>Connect</strong>.</p>
+    <div id="login-status"></div>
+
+    <div id="mapping-section">
+      <p class="settings-section-title" style="margin-top:12px;">Account Mapping</p>
+      <p class="setting-hint" style="margin-bottom:6px;">Map each account to its Monarch Money account.</p>
+      <div id="mapping-rows"></div>
+      <div class="settings-btn-row">
+        <button id="refresh-accounts">Refresh Accounts</button>
+        <button id="save-mapping">Save Mapping</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Tab bar ────────────────────────────────────────────────────────── -->
+  <nav class="tab-bar">
+    <button id="tab-mohela" class="tab-btn tab-active">
+      <span id="dot-mohela" class="tab-dot" style="background:#bebbb8;"></span>Mohela
+    </button>
+    <button id="tab-pru" class="tab-btn">
+      <span id="dot-pru" class="tab-dot" style="background:#bebbb8;"></span>Prudential
+    </button>
+  </nav>
+
+  <!-- ── Mohela panel ───────────────────────────────────────────────────── -->
+  <div id="panel-mohela" class="source-panel">
+    <div class="login-strip">
+      <span>Need to sign in or data not updating?</span>
+      <a href="https://myaccount.mohela.studentaid.gov/" target="_blank">Open Mohela &#8599;</a>
+    </div>
+    <div class="source-card">
+      <div class="source-card-header">
+        <span class="source-badge badge-mohela">&#127979; Mohela</span>
+        <small id="mohela-asof" style="color:#84827f;font-size:10px;"></small>
+      </div>
+      <div id="balance" class="data-display">
+        <span class="no-data">No data. Navigate to your Mohela account page and click Sync.</span>
+      </div>
+    </div>
+    <button id="sync" class="btn-sync">&#8635; Sync Now</button>
+    <button id="export" class="btn-export" disabled>&#8595; Export Balances CSV</button>
+    <button id="export-transactions" class="btn-export" disabled>&#8595; Export Transactions CSV</button>
+  </div>
+
+  <!-- ── Prudential panel ───────────────────────────────────────────────── -->
+  <div id="panel-pru" class="source-panel" style="display:none;">
+    <div class="login-strip">
+      <span>Need to sign in or data not updating?</span>
+      <a href="https://www.prudential.com/mypru/myaccounts/" target="_blank">Open Prudential &#8599;</a>
+    </div>
+    <div class="source-card">
+      <div class="source-card-header">
+        <span class="source-badge badge-prudential">&#127959; Prudential</span>
+        <small id="pru-asof" style="color:#84827f;font-size:10px;"></small>
+      </div>
+      <div id="pru-balance" class="data-display">
+        <span class="no-data">No data. Visit the <a href="https://www.prudential.com/mypru/myaccounts/" target="_blank">My Accounts</a> page while logged in, then click Sync.</span>
+      </div>
+    </div>
+    <button id="sync-pru" class="btn-sync">&#8635; Sync Now</button>
+    <div id="pru-sync-status" style="font-size:11px;color:#84827f;margin-top:5px;min-height:14px;word-break:break-word;"></div>
+    <button id="export-pru" class="btn-export" disabled>&#8595; Export Balances CSV</button>
+    <button id="export-pru-tx" class="btn-export" disabled>&#8595; Export Transactions CSV</button>
+  </div>
+
+  <!-- ── Bottom bar ─────────────────────────────────────────────────────── -->
+  <div class="bottom-bar">
+    <button id="sync-monarch" class="btn-primary" disabled title="Connect to Monarch in &#9881; Settings first">
+      &#9650; Sync All to Monarch Money
+    </button>
+    <div id="monarch-status"></div>
+    <div class="reset-row">
+      <button id="reset-sync-history">
+        Reset sync history (<span id="synced-count">0</span>)
+      </button>
+    </div>
+  </div>
+
   <script src="popup.js"></script>
 </body>
 </html>
