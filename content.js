@@ -24,6 +24,7 @@
     const dueDate = row.querySelector(".amount-section .textoverflow")?.innerText.trim() || "";
     const status = row.querySelector(".status.textoverflow")?.innerText.trim() || "";
     const autoPay = row.querySelector(".autoPay .sr-only")?.textContent.includes("Enrolled") ? "Yes" : "No";
+    const rowText = row.innerText?.replace(/\u00A0/g, " ").trim() || "";
 
     data.loans.push({
       name,
@@ -33,7 +34,8 @@
       type,
       dueDate,
       status,
-      autoPay
+      autoPay,
+      rowText
     });
   });
 

@@ -6,6 +6,7 @@ A Chrome extension for manually syncing Mohela student loan data and Prudential 
 
 - Mohela loan balances.
 - Mohela loan payment transactions.
+- Mohela daily loan interest backfill for stagnant recent balance-history days.
 - Prudential annuity account values.
 - Prudential annuity transactions.
 - Manual Monarch Money account balances and transactions based on your saved account mapping.
@@ -19,6 +20,8 @@ accountId|YYYY-MM-DD|absoluteAmount
 ```
 
 If existing Monarch transactions cannot be loaded, the sync aborts instead of risking duplicate transaction creation. A local sync history is also kept as a secondary guard.
+
+The Monarch-side duplicate check expands to the oldest scraped Mohela or Prudential transaction date, so clearing local sync history should not recreate older transactions that already exist in Monarch.
 
 ## Project Files
 
@@ -51,7 +54,8 @@ After any code or manifest change, reload the unpacked extension from `chrome://
 4. Click Connect.
 5. Click Refresh Accounts if needed.
 6. Map each Mohela and Prudential source account to the correct Monarch Money account.
-7. Click Save Mapping.
+7. Enter each Mohela loan's APR if it is not already filled from the scraped Mohela data.
+8. Click Save Mapping.
 
 ## Daily Use
 
@@ -59,6 +63,8 @@ After any code or manifest change, reload the unpacked extension from `chrome://
 2. Open Prudential, log in, and click Sync Now on the Prudential tab in the extension.
 3. Confirm the account dots are green.
 4. Click Sync All to Monarch Money.
+
+During Monarch sync, Mohela loans with a saved APR automatically check the last 60 days of Monarch balance history, ignore dates before September 1, 2023, upload corrected balance-history rows for stale days, and then record the new current balance. Interest backfill updates balance history only; it does not create interest transactions.
 
 ## CSV Exports
 

@@ -6,6 +6,21 @@ const MONARCH_ENDPOINTS = [
 const MONARCH_API  = MONARCH_ENDPOINTS[0].api;
 const MONARCH_APP  = MONARCH_ENDPOINTS[0].app;
 const GRAPHQL_URL  = `${MONARCH_API}/graphql`;
+const ZERO_BALANCE_RE = /^\s*(?:-|\()?[\s$]*0+(?:[.,]0+)?\)?\s*$/;
+const INACTIVE_MOHELA_STATUS_RE = /\b(?:inactive|paid\s*in\s*full|paid\s*off|closed|transferred|discharged|consolidated|cancell?ed)\b/i;
+
+function localIsoDate(date = new Date()) {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function localIsoDateDaysAgo(days) {
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+  return localIsoDate(date);
+}
 
 // ─── Headers ──────────────────────────────────────────────────────────────────
 // The declarativeNetRequest rule in monarch_rules.json rewrites the Origin and
@@ -212,18 +227,45 @@ async function monarchGraphQL(csrfToken, query, variables = {}) {
 }
 
 async function monarchFetchAccounts(csrfToken) {
-  const data = await monarchGraphQL(csrfToken, `
-    query GetAccounts {
-      accounts {
-        id
-        displayName
-        displayBalance
-        isManual
-        type { name display }
-      }
+  const queries = [
+    {
+      label: 'currentBalance',
+      query: `query GetAccounts {
+        accounts {
+          id
+          displayName
+          currentBalance
+          isManual
+          type { name display }
+        }
+      }`,
+    },
+    {
+      label: 'displayBalance',
+      query: `query GetAccounts {
+        accounts {
+          id
+          displayName
+          displayBalance
+          isManual
+          type { name display }
+        }
+      }`,
+    },
+  ];
+
+  let lastError = null;
+  for (const attempt of queries) {
+    try {
+      const data = await monarchGraphQL(csrfToken, attempt.query);
+      return data?.accounts || [];
+    } catch (e) {
+      lastError = e;
+      console.warn(`Account fetch attempt "${attempt.label}" failed:`, e.message);
     }
-  `);
-  return data?.accounts || [];
+  }
+
+  throw lastError || new Error('Monarch account fetch failed');
 }
 
 /**
@@ -321,9 +363,8 @@ function pruCategoryId(pruType, txName, categories) {
 async function monarchFetchExistingTransactions(csrfToken, accountIds, lookbackDays = 730) {
   if (!accountIds?.length) return new Set();
 
-  const startDate = new Date(Date.now() - lookbackDays * 86400000)
-    .toISOString().slice(0, 10);
-  const endDate = new Date().toISOString().slice(0, 10);
+  const startDate = localIsoDateDaysAgo(lookbackDays);
+  const endDate = localIsoDate();
   const pageSize = 500;
 
   // Use variables for pagination rather than inline literals, and try both the
@@ -427,19 +468,488 @@ async function monarchFetchExistingTransactions(csrfToken, accountIds, lookbackD
   throw new Error(`All dedup query attempts failed. Last error: ${lastError?.message || 'unknown error'}`);
 }
 
-async function monarchUpdateBalance(csrfToken, accountId, balance) {
-  return monarchGraphQL(csrfToken, `
+function isIsoDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value || '');
+}
+
+function daysAgoForDate(date) {
+  const parsed = new Date(date + 'T00:00:00Z');
+  if (isNaN(parsed.getTime())) return null;
+  const today = new Date(localIsoDate() + 'T00:00:00Z');
+  const days = Math.ceil((today - parsed) / 86400000);
+  return days >= 0 ? days : null;
+}
+
+function dedupLookbackDaysForSync(mohelaLoans, prudentialAnnuity) {
+  const dates = [
+    ...(mohelaLoans?.transactions || []).map(tx => tx.date),
+    ...(prudentialAnnuity?.transactions || []).map(tx => tx.date),
+  ].filter(isIsoDate);
+
+  const oldestDate = dates.sort()[0];
+  const days = oldestDate ? daysAgoForDate(oldestDate) : null;
+  return Math.max(730, (days || 0) + 7);
+}
+
+function normalizeText(value) {
+  return String(value ?? '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function parseMoneyAmount(value) {
+  if (typeof value === 'number') return value;
+
+  const raw = normalizeText(value);
+  if (!raw) return NaN;
+
+  const isNegative = /^\s*(?:-|\()/.test(raw);
+  const match = raw.match(/\d[\d,]*(?:\.\d+)?/);
+  if (!match) return NaN;
+
+  const parsed = parseFloat(match[0].replace(/,/g, ''));
+  if (!Number.isFinite(parsed)) return NaN;
+  return isNegative ? -parsed : parsed;
+}
+
+function moneyAmountsFromText(value, requireDollar = false) {
+  const raw = normalizeText(value);
+  if (!raw) return [];
+
+  const re = requireDollar
+    ? /(?:[-(]\s*)?\$\s*\d[\d,]*(?:\.\d+)?\)?/g
+    : /(?:[-(]\s*)?\$?\s*\d[\d,]*(?:\.\d+)?\)?/g;
+
+  return (raw.match(re) || [])
+    .map(parseMoneyAmount)
+    .filter(Number.isFinite);
+}
+
+function currentBalanceAmount(value) {
+  const raw = normalizeText(value);
+  if (!raw) return NaN;
+
+  const labelled = raw.match(/(?:current\s+)?balance.{0,40}?((?:[-(]\s*)?\$?\s*\d[\d,]*(?:\.\d+)?\)?)/i);
+  if (labelled) return parseMoneyAmount(labelled[1]);
+
+  const dollarAmounts = moneyAmountsFromText(raw, true);
+  if (dollarAmounts.length === 1) return dollarAmounts[0];
+
+  return parseMoneyAmount(raw);
+}
+
+function isZeroBalanceValue(value) {
+  const raw = normalizeText(value);
+  if (!raw) return false;
+
+  const dollarAmounts = moneyAmountsFromText(raw, true);
+  if (dollarAmounts.length && dollarAmounts.every(amount => Math.abs(amount) < 0.005)) return true;
+
+  const amount = currentBalanceAmount(raw);
+  return ZERO_BALANCE_RE.test(raw) || (Number.isFinite(amount) && Math.abs(amount) < 0.005);
+}
+
+function isInactiveMohelaLoan(loan) {
+  return [loan?.status, loan?.repaymentPlan, loan?.type, loan?.rowText]
+    .map(normalizeText)
+    .some(value => INACTIVE_MOHELA_STATUS_RE.test(value));
+}
+
+function isHiddenMohelaLoan(loan) {
+  return isZeroBalanceValue(loan?.currentBalance) || isInactiveMohelaLoan(loan);
+}
+
+function visibleMohelaLoans(mohelaLoans) {
+  return (mohelaLoans?.loans || []).filter(loan => !isHiddenMohelaLoan(loan));
+}
+
+function errorValueToMessage(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(errorValueToMessage).filter(Boolean).join('; ');
+  if (typeof value === 'object') {
+    if (Array.isArray(value.messages)) {
+      return `${value.field ? value.field + ': ' : ''}${value.messages.join(', ')}`;
+    }
+    const fieldErrors = errorValueToMessage(value.fieldErrors);
+    const message = value.message || value.detail || value.error || value.code;
+    return [message, fieldErrors].filter(Boolean).join(': ');
+  }
+  return String(value);
+}
+
+function balanceUploadResponseErrorText(text) {
+  if (!text) return '';
+  try {
+    const json = JSON.parse(text);
+    if (json?.success === false) return errorValueToMessage(json.errors || json.error || json.detail || json.message) || 'Monarch balance-history upload was not successful';
+    return errorValueToMessage(json?.errors || json?.error || json?.detail || json?.non_field_errors);
+  } catch {
+    return '';
+  }
+}
+
+function parseJsonObject(text) {
+  if (!text || typeof text !== 'string') return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function truncateForError(value, max = 500) {
+  const raw = typeof value === 'string' ? value : JSON.stringify(value);
+  if (!raw) return '';
+  return raw.length > max ? `${raw.slice(0, max)}...` : raw;
+}
+
+function findKeyValueDeep(value, keyNames) {
+  if (!value || typeof value !== 'object') return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findKeyValueDeep(item, keyNames);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  for (const [key, item] of Object.entries(value)) {
+    if (keyNames.includes(key) && typeof item === 'string' && item.trim()) {
+      return item.trim();
+    }
+    const found = findKeyValueDeep(item, keyNames);
+    if (found) return found;
+  }
+  return null;
+}
+
+function balanceUploadSessionKey(uploadResult) {
+  if (uploadResult?.sessionKey) return uploadResult.sessionKey;
+  const json = parseJsonObject(uploadResult?.text);
+  return findKeyValueDeep(json, ['session_key', 'sessionKey']);
+}
+
+function balanceUploadResponsePreview(uploadResult) {
+  const json = parseJsonObject(uploadResult?.text);
+  return truncateForError(json || uploadResult?.text || uploadResult || 'empty upload response');
+}
+
+function signedBalanceForHistory(balance, isLiability = false) {
+  const amount = Math.abs(parseFloat(balance));
+  return isLiability ? -amount : amount;
+}
+
+function numericBalance(value) {
+  const parsed = typeof value === 'number' ? value : currentBalanceAmount(value);
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function balanceMatches(actual, expected) {
+  const parsed = numericBalance(actual);
+  return Number.isFinite(parsed) && Math.abs(parsed - expected) <= 0.01;
+}
+
+function accountBalanceMatches(account, amount, isLiability = false) {
+  if (!account) return false;
+  const absolute = Math.abs(parseFloat(amount));
+  const signed = signedBalanceForHistory(absolute, isLiability);
+  const acceptable = isLiability ? [signed, absolute] : [absolute];
+
+  return ['currentBalance', 'displayBalance'].some(field =>
+    acceptable.some(expected => balanceMatches(account[field], expected))
+  );
+}
+
+function accountBalanceSummary(account) {
+  if (!account) return 'no account returned';
+  const current = account.currentBalance ?? 'n/a';
+  const display = account.displayBalance ?? 'n/a';
+  return `current=${current}, display=${display}`;
+}
+
+function waitMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function monarchFetchAccount(csrfToken, accountId) {
+  const attempts = [
+    {
+      label: 'UUID',
+      query: `query GetAccountForBalanceVerify($id: UUID!) {
+        account(id: $id) {
+          id
+          displayName
+          currentBalance
+          displayBalance
+          isAsset
+          isManual
+          __typename
+        }
+      }`,
+    },
+    {
+      label: 'ID',
+      query: `query GetAccountForBalanceVerify($id: ID!) {
+        account(id: $id) {
+          id
+          displayName
+          currentBalance
+          displayBalance
+          isAsset
+          isManual
+          __typename
+        }
+      }`,
+    },
+  ];
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const data = await monarchGraphQL(csrfToken, attempt.query, { id: accountId });
+      if (data?.account) return data.account;
+    } catch (e) {
+      lastError = e;
+      console.warn(`Account verify fetch "${attempt.label}" failed:`, e.message);
+    }
+  }
+
+  throw lastError || new Error('Could not fetch Monarch account after balance update');
+}
+
+async function monarchUpdateBalanceViaGraphQL(csrfToken, accountId, balance, { isLiability = false } = {}) {
+  const query = `
     mutation Common_UpdateAccount($input: UpdateAccountMutationInput!) {
       updateAccount(input: $input) {
-        account { id displayName displayBalance __typename }
-        errors { message __typename }
+        account { id displayName currentBalance displayBalance __typename }
+        errors { message code fieldErrors { field messages __typename } __typename }
         __typename
       }
     }
-  `, { input: { id: accountId, displayBalance: balance } });
+  `;
+
+  const amount = Math.abs(parseFloat(balance));
+  const signed = signedBalanceForHistory(amount, isLiability);
+  const attempts = [
+    { label: 'currentBalance', input: { id: accountId, currentBalance: isLiability ? signed : amount } },
+    ...(isLiability ? [{ label: 'currentBalance-positive', input: { id: accountId, currentBalance: amount } }] : []),
+    { label: 'displayBalance', input: { id: accountId, displayBalance: amount } },
+    ...(isLiability ? [{ label: 'displayBalance-signed', input: { id: accountId, displayBalance: signed } }] : []),
+  ];
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const result = await monarchGraphQL(csrfToken, query, { input: attempt.input });
+      const errs = result?.updateAccount?.errors;
+      if (errs?.length) throw new Error(errorValueToMessage(errs) || 'Monarch balance update failed');
+      if (accountBalanceMatches(result?.updateAccount?.account, amount, isLiability)) {
+        return result;
+      }
+
+      await waitMs(500);
+      const account = await monarchFetchAccount(csrfToken, accountId);
+      if (accountBalanceMatches(account, amount, isLiability)) {
+        result.updateAccount.account = account;
+        return result;
+      }
+
+      throw new Error(`Monarch accepted ${attempt.label}, but balance still reads ${accountBalanceSummary(account)}`);
+    } catch (e) {
+      lastError = e;
+      console.warn(`Balance update attempt "${attempt.label}" failed:`, e.message);
+    }
+  }
+
+  throw lastError || new Error('Monarch balance update failed');
 }
 
-async function monarchCreateTransaction(csrfToken, accountId, date, amount, categoryId, notes, merchant) {
+async function verifyBalanceHistoryRows(csrfToken, accountId, rows) {
+  const cleanRows = [...(rows || [])]
+    .filter(row => isIsoDate(row.date) && Number.isFinite(row.balance));
+  if (!cleanRows.length) return { ok: true, matched: 0 };
+
+  const dates = cleanRows.map(row => row.date).sort();
+  const expectedByDate = new Map(cleanRows.map(row => [row.date, row.balance]));
+
+  for (const delayMs of [500, 2000, 4000]) {
+    await waitMs(delayMs);
+    const history = await monarchFetchBalanceHistory(csrfToken, accountId, dates[0], dates[dates.length - 1]);
+    const actualByDate = new Map(history.map(row => [row.date, row.balance]));
+    const missing = [];
+
+    for (const [date, expected] of expectedByDate) {
+      const actual = actualByDate.get(date);
+      if (!balanceMatches(actual, expected)) {
+        missing.push(`${date} expected ${expected.toFixed(2)}${Number.isFinite(actual) ? ` got ${actual.toFixed(2)}` : ''}`);
+      }
+    }
+
+    if (!missing.length) return { ok: true, matched: cleanRows.length };
+
+    if (delayMs === 4000) {
+      return { ok: false, matched: cleanRows.length - missing.length, message: missing.slice(0, 3).join('; ') };
+    }
+  }
+
+  return { ok: false, matched: 0, message: 'Balance history verification did not complete' };
+}
+
+async function monarchGetBalanceUploadSession(csrfToken, sessionKey) {
+  const attempts = [
+    {
+      label: 'with-error-message',
+      query: `query Web_GetUploadBalanceHistorySession($sessionKey: String!) {
+        uploadBalanceHistorySession(sessionKey: $sessionKey) {
+          sessionKey
+          status
+          errorMessage
+          __typename
+        }
+      }`,
+    },
+    {
+      label: 'basic',
+      query: `query Web_GetUploadBalanceHistorySession($sessionKey: String!) {
+        uploadBalanceHistorySession(sessionKey: $sessionKey) {
+          sessionKey
+          status
+          __typename
+        }
+      }`,
+    },
+  ];
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const data = await monarchGraphQL(csrfToken, attempt.query, { sessionKey });
+      if (data?.uploadBalanceHistorySession) return data.uploadBalanceHistorySession;
+    } catch (e) {
+      lastError = e;
+      console.warn(`Balance-history session query "${attempt.label}" failed:`, e.message);
+    }
+  }
+
+  throw lastError || new Error('Could not read Monarch balance-history upload session');
+}
+
+async function monarchParseBalanceHistorySession(csrfToken, uploadResult) {
+  const sessionKey = balanceUploadSessionKey(uploadResult);
+  if (!sessionKey) {
+    throw new Error(`Monarch upload response did not include session_key (${balanceUploadResponsePreview(uploadResult)})`);
+  }
+
+  const attempts = [
+    {
+      label: 'with-error-message',
+      query: `mutation Web_ParseUploadBalanceHistorySession($input: ParseBalanceHistoryInput!) {
+        parseBalanceHistory(input: $input) {
+          uploadBalanceHistorySession {
+            sessionKey
+            status
+            errorMessage
+            __typename
+          }
+          __typename
+        }
+      }`,
+    },
+    {
+      label: 'basic',
+      query: `mutation Web_ParseUploadBalanceHistorySession($input: ParseBalanceHistoryInput!) {
+        parseBalanceHistory(input: $input) {
+          uploadBalanceHistorySession {
+            sessionKey
+            status
+            __typename
+          }
+          __typename
+        }
+      }`,
+    },
+  ];
+
+  let session = null;
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const data = await monarchGraphQL(csrfToken, attempt.query, { input: { sessionKey } });
+      session = data?.parseBalanceHistory?.uploadBalanceHistorySession || null;
+      if (session) break;
+    } catch (e) {
+      lastError = e;
+      console.warn(`Balance-history parse mutation "${attempt.label}" failed:`, e.message);
+    }
+  }
+
+  if (!session) throw lastError || new Error('Monarch did not return a balance-history import session');
+
+  for (const delayMs of [500, 1000, 2000, 3000, 5000]) {
+    const status = String(session.status || '').toLowerCase();
+    if (status === 'completed') return session;
+    if (status === 'errored' || status === 'error') {
+      throw new Error(session.errorMessage || `Monarch balance-history import status: ${session.status}`);
+    }
+
+    await waitMs(delayMs);
+    session = await monarchGetBalanceUploadSession(csrfToken, sessionKey);
+  }
+
+  return session;
+}
+
+async function monarchUploadAndVerifyBalanceHistory(csrfToken, accountId, rows) {
+  const uploadResult = await monarchUploadBalanceHistory(csrfToken, accountId, rows);
+  let parseError = null;
+
+  if (!uploadResult?.skipped) {
+    try {
+      const session = await monarchParseBalanceHistorySession(csrfToken, uploadResult);
+      console.log('Balance-history import session:', session);
+    } catch (err) {
+      parseError = err;
+      console.warn('Balance-history import parse step failed:', err.message);
+    }
+  }
+
+  const verified = await verifyBalanceHistoryRows(csrfToken, accountId, rows);
+  if (!verified.ok) {
+    const importDetail = parseError
+      ? `; import step failed: ${parseError.message}`
+      : `; upload response: ${balanceUploadResponsePreview(uploadResult)}`;
+    throw new Error(`Monarch accepted the balance-history upload, but the uploaded rows were not visible afterward (${verified.message})${importDetail}`);
+  }
+  return verified;
+}
+
+async function monarchUpdateBalance(csrfToken, accountId, balance, { isLiability = false } = {}) {
+  const amount = Math.abs(parseFloat(balance));
+  if (!Number.isFinite(amount)) throw new Error('Invalid balance amount');
+
+  try {
+    const result = await monarchUpdateBalanceViaGraphQL(csrfToken, accountId, amount, { isLiability });
+    result.method = 'graphql';
+    return result;
+  } catch (graphqlErr) {
+    console.warn('GraphQL balance update failed; trying balance-history upload:', graphqlErr.message);
+
+    const today = localIsoDate();
+    const signedBalance = signedBalanceForHistory(amount, isLiability);
+
+    try {
+      await monarchUploadAndVerifyBalanceHistory(csrfToken, accountId, [{ date: today, balance: signedBalance }]);
+      return { method: 'balance-history', updateAccount: { errors: [] } };
+    } catch (uploadErr) {
+      throw new Error(`GraphQL balance update failed: ${graphqlErr.message}; balance-history upload failed: ${uploadErr.message}`);
+    }
+  }
+}
+
+async function monarchCreateTransaction(
+  csrfToken, accountId, date, amount, categoryId, notes, merchant,
+  shouldUpdateBalance = false
+) {
   return monarchGraphQL(csrfToken, `
     mutation Common_CreateTransactionMutation($input: CreateTransactionMutationInput!) {
       createTransaction(input: $input) {
@@ -460,21 +970,208 @@ async function monarchCreateTransaction(csrfToken, accountId, date, amount, cate
       // causes Monarch to return a field-required validation error.
       ...(categoryId ? { categoryId } : {}),
       notes: notes || 'Synced via Chrome Ext',
-      shouldUpdateBalance: false,
+      shouldUpdateBalance,
     },
   });
+}
+
+function balanceHistoryCsvCell(value) {
+  const raw = String(value ?? '');
+  return /[",\r\n]/.test(raw) ? `"${raw.replace(/"/g, '""')}"` : raw;
+}
+
+function balanceHistoryCsv(rows, accountName = '') {
+  const cleanRows = [...rows]
+    .filter(row => isIsoDate(row.date) && Number.isFinite(row.balance))
+    .sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+
+  const includeAccount = !!accountName;
+  const header = includeAccount ? 'Date,Balance,Account' : 'Date,Balance';
+  const body = cleanRows.map(row => {
+    const values = [row.date, row.balance.toFixed(2)];
+    if (includeAccount) values.push(accountName);
+    return values.map(balanceHistoryCsvCell).join(',');
+  });
+
+  return [header, ...body].join('\n');
+}
+
+async function monarchUploadBalanceHistoryFromTab(csrfToken, accountId, csvContent) {
+  const tabs = await chrome.tabs.query({ url: MONARCH_TAB_PATTERNS });
+  if (!tabs.length) throw new Error('No open Monarch Money tab found');
+
+  const errors = [];
+  const filename = `balance-history-${accountId}.csv`;
+  for (const tab of tabs) {
+    const apiUrl = monarchApiForTabUrl(tab.url);
+    try {
+      const [injected] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: 'MAIN',
+        func: async ({ apiUrl, csrfToken, accountId, csvContent, filename }) => {
+          const fromCookie = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/);
+          const token = fromCookie ? decodeURIComponent(fromCookie[1]) : csrfToken;
+          const form = new FormData();
+          form.append('files', new Blob([csvContent], { type: 'text/csv' }), filename);
+          form.append('account_files_mapping', JSON.stringify({ [filename]: accountId }));
+
+          try {
+            const resp = await fetch(`${apiUrl}/account-balance-history/upload/`, {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'Accept': 'application/json',
+                'Client-Platform': 'web',
+                'monarch-client': 'web',
+                'monarch-client-version': '2025.05',
+                ...(token ? { 'X-Csrftoken': token } : {}),
+              },
+              body: form,
+            });
+            const text = await resp.text();
+            if (!resp.ok) {
+              return { ok: false, error: `Monarch balance-history upload HTTP ${resp.status}${text ? ' - ' + text.slice(0, 240) : ''}` };
+            }
+            try {
+              const json = text ? JSON.parse(text) : null;
+              const errors = json?.errors || json?.error || json?.detail;
+              if (errors) return { ok: false, error: Array.isArray(errors) ? errors.map(e => e.message || e).join('; ') : String(errors) };
+            } catch {
+              // Some successful upload responses are not JSON.
+            }
+            return { ok: true, text };
+          } catch (e) {
+            return { ok: false, error: e.message || String(e) };
+          }
+        },
+        args: [{ apiUrl, csrfToken, accountId, csvContent, filename }],
+      });
+
+      const result = injected?.result;
+      if (result?.ok) {
+        const semanticError = balanceUploadResponseErrorText(result.text);
+        if (!semanticError) {
+          return {
+            ...result,
+            filename,
+            sessionKey: balanceUploadSessionKey(result),
+          };
+        }
+        errors.push(`${apiUrl}: ${semanticError}`);
+        continue;
+      }
+      errors.push(`${apiUrl}: ${result?.error || 'empty injected result'}`);
+    } catch (e) {
+      errors.push(`${apiUrl}: ${e.message}`);
+    }
+  }
+
+  throw new Error(errors.join(' | '));
+}
+
+async function monarchUploadBalanceHistoryViaExtension(csrfToken, accountId, csvContent) {
+  const filename = `balance-history-${accountId}.csv`;
+  let lastError = null;
+
+  for (const endpoint of MONARCH_ENDPOINTS) {
+    const form = new FormData();
+    form.append('files', new Blob([csvContent], { type: 'text/csv' }), filename);
+    form.append('account_files_mapping', JSON.stringify({ [filename]: accountId }));
+
+    try {
+      const resp = await fetch(`${endpoint.api}/account-balance-history/upload/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Accept': 'application/json',
+          'Client-Platform': 'web',
+          'monarch-client': 'web',
+          'monarch-client-version': '2025.05',
+          ...(csrfToken ? { 'X-Csrftoken': csrfToken } : {}),
+        },
+        body: form,
+      });
+      const text = await resp.text();
+      if (!resp.ok) {
+        lastError = new Error(`${endpoint.api}: Monarch balance-history upload HTTP ${resp.status}${text ? ' - ' + text.slice(0, 240) : ''}`);
+        continue;
+      }
+      try {
+        const semanticError = balanceUploadResponseErrorText(text);
+        if (semanticError) {
+          lastError = new Error(`${endpoint.api}: ${semanticError}`);
+          continue;
+        }
+      } catch {}
+      const result = { ok: true, text, filename };
+      result.sessionKey = balanceUploadSessionKey(result);
+      return result;
+    } catch (e) {
+      lastError = new Error(`${endpoint.api}: Network error: ${e.message}`);
+    }
+  }
+
+  throw lastError || new Error('Monarch balance-history upload failed');
+}
+
+async function monarchUploadBalanceHistory(csrfToken, accountId, rows) {
+  if (!rows?.length) return { ok: true, skipped: true };
+
+  let accountName = accountId;
+  try {
+    accountName = (await monarchFetchAccount(csrfToken, accountId))?.displayName || accountName;
+  } catch (e) {
+    console.warn('Could not fetch Monarch account name for balance-history CSV:', e.message);
+  }
+
+  const csvContent = balanceHistoryCsv(rows, accountName);
+  try {
+    return await monarchUploadBalanceHistoryFromTab(csrfToken, accountId, csvContent);
+  } catch (e) {
+    console.warn('Monarch tab balance-history upload failed; trying extension fetch:', e.message);
+    try {
+      return await monarchUploadBalanceHistoryViaExtension(csrfToken, accountId, csvContent);
+    } catch (fallbackError) {
+      throw new Error(`Tab upload failed: ${e.message}; extension upload failed: ${fallbackError.message}`);
+    }
+  }
 }
 
 // ─── Monarch balance history ───────────────────────────────────────────────────
 
 /**
  * Fetch daily balance snapshots for a Monarch account over a date range.
- * Tries three different query shapes in case the schema has changed.
+ * Tries multiple query shapes in case the schema has changed.
  * Returns an array of {date: "YYYY-MM-DD", balance: number} objects sorted
  * ascending, or an empty array if all attempts fail (never throws).
  */
 async function monarchFetchBalanceHistory(csrfToken, accountId, startDate, endDate) {
   const attempts = [
+    {
+      label: 'snapshotsForAccount',
+      query: `query GetAccountSnapshots($accountId: UUID!) {
+        snapshots: snapshotsForAccount(accountId: $accountId) {
+          date
+          signedBalance
+        }
+      }`,
+      vars: { accountId },
+      extract: d => d?.snapshots?.map(s => ({ date: s.date, balance: parseFloat(s.signedBalance) })),
+    },
+    {
+      label: 'balanceHistory-on-account-with-range',
+      query: `query GetBalanceHistory($accountId: ID!, $startDate: Date, $endDate: Date) {
+        account(id: $accountId) {
+          id
+          balanceHistory(startDate: $startDate, endDate: $endDate) {
+            date
+            balance
+          }
+        }
+      }`,
+      vars: { accountId, startDate, endDate },
+      extract: d => d?.account?.balanceHistory,
+    },
     {
       label: 'historicalBalances-on-account',
       query: `query GetAccountBalanceHistory($accountId: ID!, $startDate: Date, $endDate: Date) {
@@ -502,16 +1199,16 @@ async function monarchFetchBalanceHistory(csrfToken, accountId, startDate, endDa
     },
     {
       label: 'balanceHistory-on-account',
-      query: `query GetBalanceHistory($accountId: ID!, $startDate: Date, $endDate: Date) {
+      query: `query GetAccountBalanceHistory($accountId: UUID!) {
         account(id: $accountId) {
           id
-          balanceHistory(startDate: $startDate, endDate: $endDate) {
+          balanceHistory {
             date
             balance
           }
         }
       }`,
-      vars: { accountId, startDate, endDate },
+      vars: { accountId },
       extract: d => d?.account?.balanceHistory,
     },
   ];
@@ -524,7 +1221,7 @@ async function monarchFetchBalanceHistory(csrfToken, accountId, startDate, endDa
         console.log(`Balance history (${attempt.label}): ${balances.length} entries for ${accountId}`);
         return balances
           .map(b => ({ date: b.date, balance: parseFloat(b.balance) }))
-          .filter(b => b.date && !isNaN(b.balance))
+          .filter(b => b.date && !isNaN(b.balance) && b.date >= startDate && b.date <= endDate)
           .sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
       }
     } catch (e) {
@@ -537,99 +1234,97 @@ async function monarchFetchBalanceHistory(csrfToken, accountId, startDate, endDa
 
 // ─── Interest accrual backfill ─────────────────────────────────────────────────
 
-/** Federal student-loan interest was frozen during COVID forbearance through Aug 31 2023. */
-const FORBEARANCE_END_DATE = '2023-09-01';
+/** Federal student-loan interest resumed on Sept. 1, 2023 after COVID forbearance. */
+const INTEREST_RESUME_DATE = '2023-09-01';
 
 /**
  * Inspect the last two months of Monarch balance history for a single Mohela loan account.
- * For every day where the balance was unchanged from the prior recorded day ("stagnant"),
- * create a daily interest accrual transaction so Monarch's net-worth history reflects
- * the true cost of the loan.
+ * For every existing history date where the balance was unchanged from the
+ * prior recorded day ("stagnant"), upload a corrected balance-history row with
+ * daily interest accrual included.
  *
  * This runs silently as part of every sync — no user action required beyond entering
  * the rate once in Settings.
  *
  * @param {string}  csrfToken
  * @param {string}  accountId          Monarch account ID for this loan
- * @param {string}  loanName           Human-readable name, used in transaction notes
+ * @param {string}  loanName           Human-readable name, used in logs
  * @param {number}  annualRatePct      e.g. 6.54 for 6.54 % APR
- * @param {object}  categories         Category map from monarchFetchCategories()
- * @param {Set}     monarchFingerprints  Live dedup set (mutated in place)
- * @param {Set}     localSynced          Local dedup set (mutated in place)
- * @returns {{ created: number, skipped: number }}
+ * @returns {{ balancesUpdated: number, balanceError: string|null }}
  */
-async function backfillLoanInterest(
-  csrfToken, accountId, loanName, annualRatePct,
-  categories, monarchFingerprints, localSynced
-) {
+async function backfillLoanInterest(csrfToken, accountId, loanName, annualRatePct) {
   if (!annualRatePct || isNaN(annualRatePct) || annualRatePct <= 0) {
-    return { created: 0, skipped: 0 };
+    return { balancesUpdated: 0, balanceError: null };
   }
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localIsoDate();
 
-  // Look back up to 60 days, but never before the forbearance end date.
-  const twoMonthsAgo    = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
-  const lookbackStart   = twoMonthsAgo > FORBEARANCE_END_DATE ? twoMonthsAgo : FORBEARANCE_END_DATE;
+  // Look back up to 60 days, but never before interest resumed.
+  const twoMonthsAgo    = localIsoDateDaysAgo(60);
+  const lookbackStart   = twoMonthsAgo > INTEREST_RESUME_DATE ? twoMonthsAgo : INTEREST_RESUME_DATE;
 
   const history = await monarchFetchBalanceHistory(csrfToken, accountId, lookbackStart, today);
-  if (history.length < 2) return { created: 0, skipped: 0 };
+  if (!history.length) return { balancesUpdated: 0, balanceError: null };
 
   const dailyRate = annualRatePct / 100 / 365;
-  let created = 0, skipped = 0;
+  const balanceRowsByDate = new Map();
+  const historyDates = new Set(history.map(row => row.date));
+  let stagnantRunStart = null;
 
   // Walk consecutive pairs. When the balance didn't change between two recorded
-  // snapshots, every day in that span (exclusive of the first, inclusive of the
-  // second and any gap days) had interest accruing with no corresponding Monarch
-  // transaction. We create one transaction per such day.
+  // snapshots, existing history dates in that span had interest accruing with no
+  // corresponding Monarch balance update. We upload corrected balance rows; no
+  // transactions are created.
   for (let i = 1; i < history.length; i++) {
     const prev = history[i - 1];
     const curr = history[i];
 
-    // Enforce hard floor — never touch pre-forbearance dates.
-    if (curr.date <= FORBEARANCE_END_DATE) continue;
+    // Enforce hard floor — never touch dates before interest resumed.
+    if (curr.date < INTEREST_RESUME_DATE) continue;
 
     // Only act on stagnant spans (balance unchanged, within $0.01 rounding).
-    if (Math.abs(curr.balance - prev.balance) > 0.01) continue;
+    if (Math.abs(curr.balance - prev.balance) > 0.01) {
+      stagnantRunStart = null;
+      continue;
+    }
 
-    // Enumerate every calendar day in the stagnant gap [prev.date+1 … curr.date].
+    if (!stagnantRunStart) stagnantRunStart = prev;
+    const baseBalance = Math.abs(stagnantRunStart.balance);
+    const signedBaseBalance = -baseBalance;
+    const dailyInterest = -(baseBalance * dailyRate);
+
+    // Enumerate the stagnant gap, but only update dates already present in the
+    // fetched balance history.
     const gapDays = gapDatesBetween(prev.date, curr.date);
     for (const day of gapDays) {
-      if (day <= FORBEARANCE_END_DATE) continue;
+      if (!historyDates.has(day)) continue;
+      if (day < INTEREST_RESUME_DATE) continue;
+      const daysSinceRunStart = daysBetween(stagnantRunStart.date, day);
+      if (daysSinceRunStart <= 0) continue;
 
-      // Daily interest is negative — it increases what the borrower owes.
-      const dailyInterest = -(prev.balance * dailyRate);
-      const absAmt        = Math.abs(dailyInterest);
-      if (absAmt < 0.001) continue;
-
-      const fp = `${accountId}|${day}|${absAmt.toFixed(2)}`;
-      if (monarchFingerprints.has(fp) || localSynced.has(fp)) {
-        skipped++;
-        continue;
-      }
-
-      try {
-        const catId = categories.interest || categories.fees || categories.default;
-        const result = await monarchCreateTransaction(
-          csrfToken, accountId, day,
-          parseFloat(dailyInterest.toFixed(2)),
-          catId,
-          `Daily interest accrual — ${loanName} (${annualRatePct}% APR)`,
-          'MOHELA Interest'
-        );
-        const errs = result?.createTransaction?.errors;
-        if (errs?.length) throw new Error(errs[0].message);
-        monarchFingerprints.add(fp);
-        localSynced.add(fp);
-        created++;
-      } catch (err) {
-        console.warn(`Interest backfill ${day} for "${loanName}":`, err.message);
-      }
+      // Upload signed liability balances. Monarch's balance-history importer
+      // expects loan balances as negative values.
+      const correctedBalance = signedBaseBalance + dailyInterest * daysSinceRunStart;
+      if (day < today) balanceRowsByDate.set(day, { date: day, balance: correctedBalance });
     }
   }
 
-  console.log(`Interest backfill "${loanName}": ${created} created, ${skipped} skipped`);
-  return { created, skipped };
+  const balanceRows = [...balanceRowsByDate.values()];
+  let balancesUpdated = 0;
+  let balanceError = null;
+  if (balanceRows.length) {
+    try {
+      const verified = await monarchUploadAndVerifyBalanceHistory(csrfToken, accountId, balanceRows);
+      balancesUpdated = verified.matched || balanceRows.length;
+      console.log(`Balance history backfill "${loanName}": ${balancesUpdated} rows verified`);
+    } catch (err) {
+      balanceError = err.message || String(err);
+      console.warn(`Balance history backfill failed for "${loanName}":`, err.message);
+    }
+  }
+
+  console.log(`Interest balance history backfill "${loanName}": ${balancesUpdated} rows uploaded`);
+  return { balancesUpdated, balanceError };
 }
 
 /**
@@ -646,6 +1341,13 @@ function gapDatesBetween(startDate, endDate) {
     d.setUTCDate(d.getUTCDate() + 1);
   }
   return days;
+}
+
+function daysBetween(startDate, endDate) {
+  const start = new Date(startDate + 'T00:00:00Z');
+  const end = new Date(endDate + 'T00:00:00Z');
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) return 0;
+  return Math.round((end - start) / 86400000);
 }
 
 // ─── Settings panel ────────────────────────────────────────────────────────────
@@ -701,22 +1403,31 @@ function renderMappingRows(mohelaLoans, prudentialAnnuity, monarchAccounts, mapp
   // Build combined list: Mohela loans + Prudential accounts
   // Keys are prefixed to avoid collisions: Mohela uses raw name, Prudential uses "pru:<name>"
   const items = [];
-  (mohelaLoans?.loans || []).forEach(l => items.push({
-    key: l.name, label: l.name, group: 'Mohela',
+  const rawMohelaLoans = mohelaLoans?.loans || [];
+  const activeMohelaLoans = visibleMohelaLoans(mohelaLoans);
+  const hiddenMohelaCount = rawMohelaLoans.length - activeMohelaLoans.length;
+
+  activeMohelaLoans.forEach(l => items.push({
+    key: l.name,
+    label: mapMohelaMappingLabel(l.name || '') || l.name,
+    title: l.name,
+    group: 'Mohela',
     scrapedRate: l.interestRate || '',   // e.g. "6.54%" — scraped from Mohela page
   }));
   (prudentialAnnuity?.accounts || []).forEach(a => items.push({
-    key: `pru:${a.name}`, label: a.name, group: 'Prudential',
+    key: `pru:${a.name}`, label: a.name, title: a.name, group: 'Prudential',
     scrapedRate: '',
   }));
 
   if (items.length === 0) {
-    container.innerHTML = '<p style="font-size:11px;color:#888">No accounts synced yet — sync Mohela and/or Prudential first.</p>';
+    container.innerHTML = hiddenMohelaCount > 0
+      ? '<p style="font-size:11px;color:#888">No active accounts to map — zero-balance and inactive Mohela loans are hidden.</p>'
+      : '<p style="font-size:11px;color:#888">No accounts synced yet — sync Mohela and/or Prudential first.</p>';
     return;
   }
 
   let lastGroup = null;
-  items.forEach(({ key, label, group, scrapedRate }) => {
+  items.forEach(({ key, label, title, group, scrapedRate }) => {
     if (group !== lastGroup) {
       const hdr = document.createElement('p');
       hdr.style.cssText = 'font-size:11px;font-weight:bold;color:#555;margin:8px 0 4px;';
@@ -731,7 +1442,7 @@ function renderMappingRows(mohelaLoans, prudentialAnnuity, monarchAccounts, mapp
 
     const span = document.createElement('span');
     span.className = 'loan-label';
-    span.title = label;
+    span.title = title || label;
     span.textContent = label;
 
     const select = document.createElement('select');
@@ -929,9 +1640,17 @@ async function syncToMonarch() {
   }
 
   if (!monarchMapping || !Object.keys(monarchMapping).length) {
-    statusEl.textContent = 'No account mapping. Open ⚙️ Settings and map your accounts first.';
+    statusEl.textContent = 'No account mapping. Open Settings and map your accounts first.';
     return;
   }
+
+  const activeMohelaLoans = visibleMohelaLoans(mohelaLoans);
+  const hiddenMohelaLoanNames = new Set(
+    (mohelaLoans?.loans || [])
+      .filter(isHiddenMohelaLoan)
+      .map(loan => (loan.name || '').trim())
+      .filter(Boolean)
+  );
 
   statusEl.textContent = 'Checking existing Monarch transactions…';
 
@@ -944,8 +1663,10 @@ async function syncToMonarch() {
   // If this fails we STOP — never risk creating duplicates without verification.
   let monarchFingerprints;
   try {
+    const dedupLookbackDays = dedupLookbackDaysForSync(mohelaLoans, prudentialAnnuity);
+    console.log(`Monarch dedup lookback: ${dedupLookbackDays} days`);
     monarchFingerprints = await monarchFetchExistingTransactions(
-      csrfToken, allMappedAccountIds
+      csrfToken, allMappedAccountIds, dedupLookbackDays
     );
   } catch (err) {
     console.error('Monarch dedup failed:', err);
@@ -962,7 +1683,7 @@ async function syncToMonarch() {
   statusEl.textContent = 'Syncing…';
   const errors   = [];
   let balancesOk = 0, balancesErr = 0, txOk = 0, txErr = 0, txSkip = 0;
-  let backfillCreated = 0, backfillSkipped = 0;
+  let backfillBalanceRows = 0;
 
   /**
    * True if a transaction already exists in Monarch OR in our local cache.
@@ -980,50 +1701,53 @@ async function syncToMonarch() {
   }
 
   // ── 1. Mohela balances + silent interest backfill ──────────────────────────
-  for (const loan of (mohelaLoans?.loans || [])) {
+  for (const loan of activeMohelaLoans) {
+    const displayName = mapAccount(loan.name || '') || loan.name;
     const accountId = monarchMapping[loan.name];
     if (!accountId) continue;
-    const balance = parseFloat((loan.currentBalance || '').replace(/ /g, ' ').replace(/[^0-9.]/g, ''));
-    if (!balance || isNaN(balance)) continue;
+    const balance = Math.abs(currentBalanceAmount(loan.currentBalance));
+    if (!balance || !Number.isFinite(balance)) continue;
 
     // Backfill stagnant days with daily interest accrual before recording the
     // new balance.  Uses the rate saved in Settings; skips silently if unset.
     const annualRate = parseFloat(loanInterestRates?.[loan.name] ?? NaN);
     if (!isNaN(annualRate) && annualRate > 0) {
-      statusEl.textContent = `Checking interest history for ${loan.name}…`;
+      statusEl.textContent = `Checking interest history for ${displayName}…`;
       try {
         const result = await backfillLoanInterest(
-          csrfToken, accountId, loan.name, annualRate,
-          categories, monarchFingerprints, localSynced
+          csrfToken, accountId, loan.name, annualRate
         );
-        backfillCreated += result.created;
-        backfillSkipped += result.skipped;
+        backfillBalanceRows += result.balancesUpdated || 0;
+        if (result.balanceError) {
+          errors.push(`Interest balance history "${displayName}": ${result.balanceError}`);
+        }
       } catch (err) {
         // Never let backfill failures block the main balance update
-        console.warn(`Interest backfill failed for "${loan.name}":`, err.message);
+        console.warn(`Interest backfill failed for "${displayName}":`, err.message);
       }
     }
 
     statusEl.textContent = 'Syncing…';
     try {
-      const result = await monarchUpdateBalance(csrfToken, accountId, balance);
+      const result = await monarchUpdateBalance(csrfToken, accountId, balance, { isLiability: true });
       const errs = result?.updateAccount?.errors;
       if (errs?.length) throw new Error(errs[0].message);
       balancesOk++;
     } catch (err) {
-      errors.push(`Balance "${loan.name}": ${err.message}`);
+      errors.push(`Balance "${displayName}": ${err.message}`);
       balancesErr++;
     }
   }
 
   // ── 2. Mohela transactions — Transfer category ─────────────────────────────
   for (const tx of (mohelaLoans?.transactions || [])) {
+    if (hiddenMohelaLoanNames.has((tx.accountRaw || '').trim())) { txSkip++; continue; }
     const accountId = monarchMapping[tx.accountRaw];
     if (!accountId) { txSkip++; continue; }
     const amount = parseFloat((tx.amount || '').toString().replace(/[^0-9.]/g, ''));
     if (!amount || isNaN(amount)) continue;
     const absAmt = Math.abs(amount);
-    const date   = tx.date || new Date().toISOString().slice(0, 10);
+    const date   = tx.date || localIsoDate();
 
     if (isDuplicate(accountId, date, absAmt)) { txSkip++; continue; }
 
@@ -1049,7 +1773,7 @@ async function syncToMonarch() {
     const balance = parseFloat((acct.accountValue || '').replace(/[^0-9.]/g, ''));
     if (!balance || isNaN(balance)) continue;
     try {
-      const result = await monarchUpdateBalance(csrfToken, accountId, balance);
+      const result = await monarchUpdateBalance(csrfToken, accountId, balance, { isLiability: false });
       const errs = result?.updateAccount?.errors;
       if (errs?.length) throw new Error(errs[0].message);
       balancesOk++;
@@ -1102,7 +1826,7 @@ async function syncToMonarch() {
   const parts = [];
   if (balancesOk)      parts.push(`✅ ${balancesOk} balance${balancesOk !== 1 ? 's' : ''} updated`);
   if (balancesErr)     parts.push(`❌ ${balancesErr} balance error${balancesErr !== 1 ? 's' : ''}`);
-  if (backfillCreated) parts.push(`📈 ${backfillCreated} interest day${backfillCreated !== 1 ? 's' : ''} backfilled`);
+  if (backfillBalanceRows) parts.push(`📉 ${backfillBalanceRows} balance histor${backfillBalanceRows !== 1 ? 'y rows' : 'y row'} backfilled`);
   if (txOk)            parts.push(`✅ ${txOk} tx synced`);
   if (txErr)           parts.push(`❌ ${txErr} tx error${txErr !== 1 ? 's' : ''}`);
   if (txSkip)          parts.push(`⏭️ ${txSkip} skipped`);
@@ -1137,10 +1861,38 @@ function switchTab(name) {
 
 // ─── Mohela Sync Now ───────────────────────────────────────────────────────────
 
+const MOHELA_TAB_PATTERNS = ['https://myaccount.mohela.studentaid.gov/*'];
+const MOHELA_URL = 'https://myaccount.mohela.studentaid.gov/';
+
 document.getElementById('sync').addEventListener('click', async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
-  setTimeout(loadData, 1500);
+  const statusEl = document.getElementById('mohela-sync-status');
+  statusEl.textContent = 'Syncing...';
+
+  const tabs = await chrome.tabs.query({ url: MOHELA_TAB_PATTERNS });
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const targetTab = tabs.find(tab => tab.id === activeTab?.id) || tabs[0];
+
+  if (!targetTab) {
+    statusEl.innerHTML =
+      '&#9888; No open Mohela tab found. '
+      + '<a href="' + MOHELA_URL + '" target="_blank">Open Mohela &#8599;</a>'
+      + ' while logged in, then click Sync again. '
+      + '<small style="color:#84827f">(The green dot shows data from your last sync is still available.)</small>';
+    return;
+  }
+
+  try {
+    await chrome.scripting.executeScript({ target: { tabId: targetTab.id }, files: ['content.js'] });
+    setTimeout(async () => {
+      await loadData();
+      statusEl.textContent = '';
+    }, 1500);
+  } catch (err) {
+    console.warn('Mohela script injection failed:', err);
+    await loadData();
+    statusEl.textContent =
+      'Could not refresh Mohela from the open tab. Make sure the Mohela tab is fully loaded, then try Sync Now again.';
+  }
 });
 
 // ─── Prudential Sync Now ───────────────────────────────────────────────────────
@@ -1227,8 +1979,7 @@ async function loadPrudentialData() {
   el.innerHTML = accounts.map(a => `
     <div>
       <b>${a.name}</b><br>
-      Account Value: <strong>${a.accountValue || 'N/A'}</strong> &nbsp;&middot;&nbsp;
-      Death Benefit: ${a.deathBenefitValue || 'N/A'}
+      Account Value: <strong>${a.accountValue || 'N/A'}</strong>
     </div><hr>
   `).join('') + `<div style="color:#888;font-size:11px;">${txCount} transaction${txCount !== 1 ? 's' : ''} loaded</div>`;
 }
@@ -1239,7 +1990,7 @@ document.getElementById('export-pru').addEventListener('click', () => {
   chrome.storage.local.get('prudentialAnnuity', ({ prudentialAnnuity }) => {
     const accounts = prudentialAnnuity?.accounts || [];
     if (!accounts.length) { alert('No Prudential account data. Sync first.'); return; }
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localIsoDate();
     const safe  = s => String(s).replace(/\r?\n/g, ' ').replace(/"/g, '""');
     const rows  = [['Date', 'Balance', 'Account']];
     accounts.forEach(a => {
@@ -1284,17 +2035,23 @@ function mapAccount(rawName) {
   return rawName;
 }
 
+function mapMohelaMappingLabel(rawName) {
+  const mapped = mapAccount(rawName);
+  const m = mapped.match(/^Federal Student Loan (\d+)$/);
+  return m ? `Federal Loan ${m[1]}` : mapped;
+}
+
 document.getElementById('export').addEventListener('click', () => {
   chrome.storage.local.get('mohelaLoans', ({ mohelaLoans }) => {
-    if (!mohelaLoans?.loans?.length) { alert('No loan data. Sync Mohela first.'); return; }
+    const activeLoans = visibleMohelaLoans(mohelaLoans);
+    if (!activeLoans.length) { alert('No active loan balances to export.'); return; }
     const rows   = [['Date', 'Balance', 'Account']];
-    const today  = new Date().toISOString().slice(0, 10);
+    const today  = localIsoDate();
     const safe   = s => s.replace(/\r?\n/g, ' ').replace(/"/g, '""');
-    const zeroRe = /^\s*[-(]?\s*\$?0+(?:[\.,]0+)?\s*[) -]?\s*$/;
-    mohelaLoans.loans.forEach(loan => {
+    activeLoans.forEach(loan => {
       const raw     = (loan.currentBalance || '').toString().replace(/ /g, ' ').trim();
-      const numeric = parseFloat(raw.replace(/[^0-9.-]+/g, ''));
-      if (!numeric || zeroRe.test(raw)) return;
+      const numeric = currentBalanceAmount(raw);
+      if (!Number.isFinite(numeric) || Math.abs(numeric) < 0.005) return;
       rows.push([safe(today), safe(raw), safe(mapAccount(loan.name || ''))]);
     });
     downloadCSV(rows, 'balances.csv');
@@ -1308,7 +2065,7 @@ document.getElementById('export-transactions').addEventListener('click', () => {
     const safe = s => s.replace(/\r?\n/g, ' ').replace(/"/g, '""');
     const seen = new Set();
     mohelaLoans.transactions.forEach(t => {
-      const date    = t.date || new Date().toISOString().slice(0, 10);
+      const date    = t.date || localIsoDate();
       const account = mapAccount(t.accountRaw || '').trim();
       if (!account) return;
       const numeric = parseFloat((t.amount || '').toString().replace(/[^0-9.-]+/g, ''));
@@ -1363,8 +2120,10 @@ async function loadData() {
   const { mohelaLoans } = await chrome.storage.local.get('mohelaLoans');
 
   // ── Set dot immediately — don't block on CSRF/session checks ──────────────
-  const hasLoans = !!(mohelaLoans?.loans?.length);
-  setDot('mohela', hasLoans ? 'green' : 'red');
+  const hasStoredLoans = !!(mohelaLoans?.loans?.length);
+  const activeLoans = visibleMohelaLoans(mohelaLoans);
+  const hasActiveLoans = activeLoans.length > 0;
+  setDot('mohela', hasStoredLoans ? 'green' : 'red');
 
   const el        = document.getElementById('balance');
   const exportBtn = document.getElementById('export');
@@ -1377,22 +2136,21 @@ async function loadData() {
     if (txBtn)     txBtn.disabled     = true;
   } else {
     const hasTx = !!(mohelaLoans.transactions?.length);
-    if (exportBtn) exportBtn.disabled = !hasLoans;
+    if (exportBtn) exportBtn.disabled = !hasActiveLoans;
     if (txBtn)     txBtn.disabled     = !hasTx;
     if (asOfEl) asOfEl.textContent = `As of ${new Date().toLocaleDateString()}`;
 
     el.innerHTML = `
       <div style="margin-bottom:6px;">
         <b>Total Balance:</b> ${mohelaLoans.totalBalance || 'N/A'} &nbsp;|&nbsp;
-        <b>Loans:</b> ${mohelaLoans.totalLoans || 'N/A'}
+        <b>Active Loans:</b> ${activeLoans.length}
       </div>
-      ${(mohelaLoans.loans || []).map(l => `
+      ${activeLoans.length ? activeLoans.map(l => `
         <div>
-          <b>${l.name}</b><br>
-          Balance: ${l.currentBalance} &nbsp;&middot;&nbsp; Rate: ${l.interestRate}<br>
-          Plan: ${l.repaymentPlan} &nbsp;&middot;&nbsp; Status: ${l.status}
+          <b>${mapAccount(l.name || '') || l.name}</b><br>
+          Balance: ${l.currentBalance} &nbsp;&middot;&nbsp; Rate: ${l.interestRate}
         </div><hr>
-      `).join('')}
+      `).join('') : '<span class="no-data">No active Mohela loan balances.</span>'}
       ${hasTx ? `<div style="color:#84827f;font-size:11px;">${mohelaLoans.transactions.length} transaction${mohelaLoans.transactions.length !== 1 ? 's' : ''} loaded</div>` : ''}
     `;
   }

@@ -55,14 +55,19 @@
     }
 
     #settings-toggle {
-      width: auto; margin: 0 0 0 auto; padding: 3px;
-      background: none; border: none; border-radius: 0;
-      color: #fefcfb; cursor: pointer; font-size: 16px;
+      width: 28px; height: 28px; margin: 0 0 0 auto; padding: 0;
+      background: none; border: none; border-radius: 5px;
+      color: #fefcfb; cursor: pointer;
       line-height: 1; display: inline-flex; align-items: center;
       justify-content: center; opacity: 0.82;
-      transition: opacity 0.12s;
+      transition: background 0.12s, opacity 0.12s;
     }
-    #settings-toggle:hover { background: none; opacity: 1; }
+    #settings-toggle svg {
+      width: 17px; height: 17px;
+      stroke: currentColor; stroke-width: 2;
+      fill: none; stroke-linecap: round; stroke-linejoin: round;
+    }
+    #settings-toggle:hover { background: rgba(254, 252, 251, 0.1); opacity: 1; }
 
     /* ── Settings panel ──────────────────────────────────────────────────── */
     #settings-panel {
@@ -189,6 +194,7 @@
       font-size: 12px; color: #363431;
       max-height: 160px; overflow-y: auto; line-height: 1.5;
     }
+    #balance.data-display { max-height: 260px; }
     .data-display b  { color: #22201d; }
     .data-display hr { border: none; border-top: 1px solid #efecea; margin: 5px 0; }
     .no-data         { color: #84827f; font-style: italic; font-size: 12px; }
@@ -258,7 +264,12 @@
         <h1>Monarch Sync</h1>
       </div>
     </div>
-    <button id="settings-toggle" title="Monarch Money Settings">&#9881;&#65039;</button>
+    <button id="settings-toggle" title="Monarch Money Settings" aria-label="Monarch Money Settings">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"></path>
+        <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.05.05a2 2 0 0 1-2.83 2.83l-.05-.05A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6V20a2 2 0 0 1-4 0v-.07a1.7 1.7 0 0 0-1-.6 1.7 1.7 0 0 0-1.88.34l-.05.05a2 2 0 0 1-2.83-2.83l.05-.05A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1H4a2 2 0 0 1 0-4h.07a1.7 1.7 0 0 0 .6-1 1.7 1.7 0 0 0-.34-1.88l-.05-.05a2 2 0 0 1 2.83-2.83l.05.05A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6V4a2 2 0 0 1 4 0v.07a1.7 1.7 0 0 0 1 .6 1.7 1.7 0 0 0 1.88-.34l.05-.05a2 2 0 0 1 2.83 2.83l-.05.05A1.7 1.7 0 0 0 19.4 9a1.7 1.7 0 0 0 .6 1H20a2 2 0 0 1 0 4h-.07a1.7 1.7 0 0 0-.6 1Z"></path>
+      </svg>
+    </button>
   </header>
 
   <!-- ── Settings panel ─────────────────────────────────────────────────── -->
@@ -309,6 +320,7 @@
       </div>
     </div>
     <button id="sync" class="btn-sync">&#8635; Sync Now</button>
+    <div id="mohela-sync-status" style="font-size:11px;color:#84827f;margin-top:5px;min-height:14px;word-break:break-word;"></div>
     <button id="export" class="btn-export" disabled>&#8595; Export Balances CSV</button>
     <button id="export-transactions" class="btn-export" disabled>&#8595; Export Transactions CSV</button>
   </div>
@@ -336,7 +348,7 @@
 
   <!-- ── Bottom bar ─────────────────────────────────────────────────────── -->
   <div class="bottom-bar">
-    <button id="sync-monarch" class="btn-primary" disabled title="Connect to Monarch in &#9881; Settings first">
+    <button id="sync-monarch" class="btn-primary" disabled title="Connect to Monarch in Settings first">
       &#9650; Sync All to Monarch Money
     </button>
     <div id="monarch-status"></div>
