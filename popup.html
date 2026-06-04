@@ -109,6 +109,25 @@
       border: 1px solid #dcd9d6; border-radius: 4px; background: #fefcfb;
     }
 
+    .rate-row {
+      display: flex; align-items: center; gap: 5px;
+      margin: 2px 0 5px 0;
+    }
+    .rate-row label {
+      font-size: 10px; color: #84827f; white-space: nowrap; flex-shrink: 0;
+    }
+    .rate-row input[type="number"] {
+      width: 72px; font-size: 11px; padding: 2px 5px;
+      border: 1px solid #dcd9d6; border-radius: 4px; background: #fefcfb;
+      color: #363431;
+    }
+    .rate-row input[type="number"]:focus {
+      outline: none; border-color: #ff692d;
+    }
+    .rate-hint {
+      font-size: 10px; color: #aaa8a5; font-style: italic;
+    }
+
     /* ── Tab bar ─────────────────────────────────────────────────────────── */
     .tab-bar {
       display: flex;

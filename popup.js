@@ -280,7 +280,14 @@ async function monarchFetchCategories(csrfToken) {
   const income = findByName('investment income', 'interest income', 'dividend income', 'other income', 'income')
               || findByGroupType('income');
 
-  const result = { transfer, income, fees, default: cats[0]?.id || null };
+  // Interest expense — used for daily student-loan interest accrual backfill.
+  // Try specific names first, then any expense-group category with "interest" in the name,
+  // then fall back to the generic fees bucket.
+  const interest = findByName('student loan interest', 'loan interest', 'interest expense', 'interest')
+                || findByGroupType('expense', 'interest')
+                || fees;
+
+  const result = { transfer, income, fees, interest, default: cats[0]?.id || null };
   console.log('Resolved category IDs:', result);
   return result;
 }
@@ -458,6 +465,189 @@ async function monarchCreateTransaction(csrfToken, accountId, date, amount, cate
   });
 }
 
+// ─── Monarch balance history ───────────────────────────────────────────────────
+
+/**
+ * Fetch daily balance snapshots for a Monarch account over a date range.
+ * Tries three different query shapes in case the schema has changed.
+ * Returns an array of {date: "YYYY-MM-DD", balance: number} objects sorted
+ * ascending, or an empty array if all attempts fail (never throws).
+ */
+async function monarchFetchBalanceHistory(csrfToken, accountId, startDate, endDate) {
+  const attempts = [
+    {
+      label: 'historicalBalances-on-account',
+      query: `query GetAccountBalanceHistory($accountId: ID!, $startDate: Date, $endDate: Date) {
+        account(id: $accountId) {
+          id
+          historicalBalances(startDate: $startDate, endDate: $endDate) {
+            date
+            balance
+          }
+        }
+      }`,
+      vars: { accountId, startDate, endDate },
+      extract: d => d?.account?.historicalBalances,
+    },
+    {
+      label: 'snapshotHistoricalBalances',
+      query: `query GetSnapshotBalances($accountId: ID!, $startDate: Date, $endDate: Date) {
+        snapshotHistoricalBalances(accountId: $accountId, startDate: $startDate, endDate: $endDate) {
+          date
+          balance
+        }
+      }`,
+      vars: { accountId, startDate, endDate },
+      extract: d => d?.snapshotHistoricalBalances,
+    },
+    {
+      label: 'balanceHistory-on-account',
+      query: `query GetBalanceHistory($accountId: ID!, $startDate: Date, $endDate: Date) {
+        account(id: $accountId) {
+          id
+          balanceHistory(startDate: $startDate, endDate: $endDate) {
+            date
+            balance
+          }
+        }
+      }`,
+      vars: { accountId, startDate, endDate },
+      extract: d => d?.account?.balanceHistory,
+    },
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const data = await monarchGraphQL(csrfToken, attempt.query, attempt.vars);
+      const balances = attempt.extract(data);
+      if (Array.isArray(balances)) {
+        console.log(`Balance history (${attempt.label}): ${balances.length} entries for ${accountId}`);
+        return balances
+          .map(b => ({ date: b.date, balance: parseFloat(b.balance) }))
+          .filter(b => b.date && !isNaN(b.balance))
+          .sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+      }
+    } catch (e) {
+      console.warn(`Balance history attempt "${attempt.label}" failed:`, e.message);
+    }
+  }
+  console.warn('All balance history queries failed for account', accountId);
+  return [];
+}
+
+// ─── Interest accrual backfill ─────────────────────────────────────────────────
+
+/** Federal student-loan interest was frozen during COVID forbearance through Aug 31 2023. */
+const FORBEARANCE_END_DATE = '2023-09-01';
+
+/**
+ * Inspect the last two months of Monarch balance history for a single Mohela loan account.
+ * For every day where the balance was unchanged from the prior recorded day ("stagnant"),
+ * create a daily interest accrual transaction so Monarch's net-worth history reflects
+ * the true cost of the loan.
+ *
+ * This runs silently as part of every sync — no user action required beyond entering
+ * the rate once in Settings.
+ *
+ * @param {string}  csrfToken
+ * @param {string}  accountId          Monarch account ID for this loan
+ * @param {string}  loanName           Human-readable name, used in transaction notes
+ * @param {number}  annualRatePct      e.g. 6.54 for 6.54 % APR
+ * @param {object}  categories         Category map from monarchFetchCategories()
+ * @param {Set}     monarchFingerprints  Live dedup set (mutated in place)
+ * @param {Set}     localSynced          Local dedup set (mutated in place)
+ * @returns {{ created: number, skipped: number }}
+ */
+async function backfillLoanInterest(
+  csrfToken, accountId, loanName, annualRatePct,
+  categories, monarchFingerprints, localSynced
+) {
+  if (!annualRatePct || isNaN(annualRatePct) || annualRatePct <= 0) {
+    return { created: 0, skipped: 0 };
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Look back up to 60 days, but never before the forbearance end date.
+  const twoMonthsAgo    = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+  const lookbackStart   = twoMonthsAgo > FORBEARANCE_END_DATE ? twoMonthsAgo : FORBEARANCE_END_DATE;
+
+  const history = await monarchFetchBalanceHistory(csrfToken, accountId, lookbackStart, today);
+  if (history.length < 2) return { created: 0, skipped: 0 };
+
+  const dailyRate = annualRatePct / 100 / 365;
+  let created = 0, skipped = 0;
+
+  // Walk consecutive pairs. When the balance didn't change between two recorded
+  // snapshots, every day in that span (exclusive of the first, inclusive of the
+  // second and any gap days) had interest accruing with no corresponding Monarch
+  // transaction. We create one transaction per such day.
+  for (let i = 1; i < history.length; i++) {
+    const prev = history[i - 1];
+    const curr = history[i];
+
+    // Enforce hard floor — never touch pre-forbearance dates.
+    if (curr.date <= FORBEARANCE_END_DATE) continue;
+
+    // Only act on stagnant spans (balance unchanged, within $0.01 rounding).
+    if (Math.abs(curr.balance - prev.balance) > 0.01) continue;
+
+    // Enumerate every calendar day in the stagnant gap [prev.date+1 … curr.date].
+    const gapDays = gapDatesBetween(prev.date, curr.date);
+    for (const day of gapDays) {
+      if (day <= FORBEARANCE_END_DATE) continue;
+
+      // Daily interest is negative — it increases what the borrower owes.
+      const dailyInterest = -(prev.balance * dailyRate);
+      const absAmt        = Math.abs(dailyInterest);
+      if (absAmt < 0.001) continue;
+
+      const fp = `${accountId}|${day}|${absAmt.toFixed(2)}`;
+      if (monarchFingerprints.has(fp) || localSynced.has(fp)) {
+        skipped++;
+        continue;
+      }
+
+      try {
+        const catId = categories.interest || categories.fees || categories.default;
+        const result = await monarchCreateTransaction(
+          csrfToken, accountId, day,
+          parseFloat(dailyInterest.toFixed(2)),
+          catId,
+          `Daily interest accrual — ${loanName} (${annualRatePct}% APR)`,
+          'MOHELA Interest'
+        );
+        const errs = result?.createTransaction?.errors;
+        if (errs?.length) throw new Error(errs[0].message);
+        monarchFingerprints.add(fp);
+        localSynced.add(fp);
+        created++;
+      } catch (err) {
+        console.warn(`Interest backfill ${day} for "${loanName}":`, err.message);
+      }
+    }
+  }
+
+  console.log(`Interest backfill "${loanName}": ${created} created, ${skipped} skipped`);
+  return { created, skipped };
+}
+
+/**
+ * Return every calendar date strictly between startDate and endDate (inclusive),
+ * i.e. [startDate+1 … endDate].  Both dates are "YYYY-MM-DD" strings.
+ */
+function gapDatesBetween(startDate, endDate) {
+  const days = [];
+  const d = new Date(startDate + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + 1); // start at startDate + 1
+  const end = new Date(endDate + 'T00:00:00Z');
+  while (d <= end) {
+    days.push(d.toISOString().slice(0, 10));
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return days;
+}
+
 // ─── Settings panel ────────────────────────────────────────────────────────────
 
 document.getElementById('settings-toggle').addEventListener('click', async () => {
@@ -468,8 +658,8 @@ document.getElementById('settings-toggle').addEventListener('click', async () =>
 });
 
 async function renderSettings() {
-  const { monarchAccounts, monarchMapping, mohelaLoans, prudentialAnnuity } =
-    await chrome.storage.local.get(['monarchAccounts', 'monarchMapping', 'mohelaLoans', 'prudentialAnnuity']);
+  const { monarchAccounts, monarchMapping, mohelaLoans, prudentialAnnuity, loanInterestRates } =
+    await chrome.storage.local.get(['monarchAccounts', 'monarchMapping', 'mohelaLoans', 'prudentialAnnuity', 'loanInterestRates']);
 
   const connStatus    = document.getElementById('connection-status');
   const loginStatus   = document.getElementById('login-status');
@@ -488,7 +678,7 @@ async function renderSettings() {
       + `<span style="font-weight:600;">Connected</span>`
       + `<span style="color:#888;">&nbsp;&mdash;&nbsp;${n > 0 ? n + ' accounts' : 'no accounts (click Refresh)'}</span>`;
     mappingSection.style.display = 'block';
-    renderMappingRows(mohelaLoans, prudentialAnnuity, monarchAccounts || [], monarchMapping || {});
+    renderMappingRows(mohelaLoans, prudentialAnnuity, monarchAccounts || [], monarchMapping || {}, loanInterestRates || {});
     updateSyncMonarchButton(true);
   } else {
     connStatus.innerHTML =
@@ -499,7 +689,7 @@ async function renderSettings() {
   }
 }
 
-function renderMappingRows(mohelaLoans, prudentialAnnuity, monarchAccounts, mapping) {
+function renderMappingRows(mohelaLoans, prudentialAnnuity, monarchAccounts, mapping, loanInterestRates = {}) {
   const container = document.getElementById('mapping-rows');
   container.innerHTML = '';
 
@@ -511,8 +701,14 @@ function renderMappingRows(mohelaLoans, prudentialAnnuity, monarchAccounts, mapp
   // Build combined list: Mohela loans + Prudential accounts
   // Keys are prefixed to avoid collisions: Mohela uses raw name, Prudential uses "pru:<name>"
   const items = [];
-  (mohelaLoans?.loans || []).forEach(l => items.push({ key: l.name, label: l.name, group: 'Mohela' }));
-  (prudentialAnnuity?.accounts || []).forEach(a => items.push({ key: `pru:${a.name}`, label: a.name, group: 'Prudential' }));
+  (mohelaLoans?.loans || []).forEach(l => items.push({
+    key: l.name, label: l.name, group: 'Mohela',
+    scrapedRate: l.interestRate || '',   // e.g. "6.54%" — scraped from Mohela page
+  }));
+  (prudentialAnnuity?.accounts || []).forEach(a => items.push({
+    key: `pru:${a.name}`, label: a.name, group: 'Prudential',
+    scrapedRate: '',
+  }));
 
   if (items.length === 0) {
     container.innerHTML = '<p style="font-size:11px;color:#888">No accounts synced yet — sync Mohela and/or Prudential first.</p>';
@@ -520,7 +716,7 @@ function renderMappingRows(mohelaLoans, prudentialAnnuity, monarchAccounts, mapp
   }
 
   let lastGroup = null;
-  items.forEach(({ key, label, group }) => {
+  items.forEach(({ key, label, group, scrapedRate }) => {
     if (group !== lastGroup) {
       const hdr = document.createElement('p');
       hdr.style.cssText = 'font-size:11px;font-weight:bold;color:#555;margin:8px 0 4px;';
@@ -529,6 +725,7 @@ function renderMappingRows(mohelaLoans, prudentialAnnuity, monarchAccounts, mapp
       lastGroup = group;
     }
 
+    // ── Account → Monarch mapping row ────────────────────────────────────────
     const row = document.createElement('div');
     row.className = 'mapping-row';
 
@@ -553,6 +750,42 @@ function renderMappingRows(mohelaLoans, prudentialAnnuity, monarchAccounts, mapp
     row.appendChild(span);
     row.appendChild(select);
     container.appendChild(row);
+
+    // ── Interest rate input (Mohela only) ─────────────────────────────────────
+    if (group === 'Mohela') {
+      // Determine the best default value: saved override > scraped from Mohela page
+      let defaultRate = loanInterestRates[key] ?? '';
+      if (defaultRate === '' && scrapedRate) {
+        // scrapedRate looks like "6.54%" or "6.54" — strip non-numeric except dot
+        const parsed = parseFloat(scrapedRate.replace(/[^0-9.]/g, ''));
+        if (!isNaN(parsed) && parsed > 0) defaultRate = parsed;
+      }
+
+      const rateRow = document.createElement('div');
+      rateRow.className = 'rate-row';
+
+      const lbl = document.createElement('label');
+      lbl.textContent = 'Interest rate:';
+      lbl.style.paddingLeft = '4px';
+
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.min  = '0';
+      input.max  = '30';
+      input.step = '0.01';
+      input.placeholder = 'e.g. 6.54';
+      input.dataset.rateLoanName = key;
+      if (defaultRate !== '') input.value = defaultRate;
+
+      const hint = document.createElement('span');
+      hint.className = 'rate-hint';
+      hint.textContent = '% APR — used to backfill stagnant days';
+
+      rateRow.appendChild(lbl);
+      rateRow.appendChild(input);
+      rateRow.appendChild(hint);
+      container.appendChild(rateRow);
+    }
   });
 }
 
@@ -627,8 +860,9 @@ document.getElementById('refresh-accounts').addEventListener('click', async () =
       monarchFetchCategories(csrfToken),
     ]);
     await chrome.storage.local.set({ monarchAccounts: accounts, monarchCategories: categories });
-    const { monarchMapping, mohelaLoans, prudentialAnnuity } = await chrome.storage.local.get(['monarchMapping', 'mohelaLoans', 'prudentialAnnuity']);
-    renderMappingRows(mohelaLoans, prudentialAnnuity, accounts, monarchMapping || {});
+    const { monarchMapping, mohelaLoans, prudentialAnnuity, loanInterestRates } =
+      await chrome.storage.local.get(['monarchMapping', 'mohelaLoans', 'prudentialAnnuity', 'loanInterestRates']);
+    renderMappingRows(mohelaLoans, prudentialAnnuity, accounts, monarchMapping || {}, loanInterestRates || {});
     statusEl.textContent = `Loaded ${accounts.length} accounts`;
     statusEl.style.color = 'green';
   } catch (err) {
@@ -644,9 +878,17 @@ document.getElementById('save-mapping').addEventListener('click', async () => {
   document.querySelectorAll('#mapping-rows select').forEach(sel => {
     if (sel.value) mapping[sel.dataset.loanName] = sel.value;
   });
-  await chrome.storage.local.set({ monarchMapping: mapping });
+
+  // Persist interest rates alongside the account mapping.
+  const loanInterestRates = {};
+  document.querySelectorAll('#mapping-rows input[data-rate-loan-name]').forEach(input => {
+    const val = parseFloat(input.value);
+    if (!isNaN(val) && val > 0) loanInterestRates[input.dataset.rateLoanName] = val;
+  });
+
+  await chrome.storage.local.set({ monarchMapping: mapping, loanInterestRates });
   const statusEl = document.getElementById('login-status');
-  statusEl.textContent = `Mapping saved (${Object.keys(mapping).length} loans)`;
+  statusEl.textContent = `Mapping saved (${Object.keys(mapping).length} account${Object.keys(mapping).length !== 1 ? 's' : ''}${Object.keys(loanInterestRates).length ? ', rates saved' : ''})`;
   statusEl.style.color = 'green';
 });
 
@@ -668,9 +910,11 @@ async function syncToMonarch() {
     mohelaLoans, prudentialAnnuity,
     monarchMapping, monarchCategories,
     syncedTransactions: syncedRaw,
+    loanInterestRates,
   } = await chrome.storage.local.get([
     'mohelaLoans', 'prudentialAnnuity',
     'monarchMapping', 'monarchCategories', 'syncedTransactions',
+    'loanInterestRates',
   ]);
 
   // Re-fetch categories every sync so stale cached IDs never persist
@@ -718,6 +962,7 @@ async function syncToMonarch() {
   statusEl.textContent = 'Syncing…';
   const errors   = [];
   let balancesOk = 0, balancesErr = 0, txOk = 0, txErr = 0, txSkip = 0;
+  let backfillCreated = 0, backfillSkipped = 0;
 
   /**
    * True if a transaction already exists in Monarch OR in our local cache.
@@ -734,12 +979,32 @@ async function syncToMonarch() {
     monarchFingerprints.add(fp); // prevent double-creation if loop runs twice
   }
 
-  // ── 1. Mohela balances ──────────────────────────────────────────────────────
+  // ── 1. Mohela balances + silent interest backfill ──────────────────────────
   for (const loan of (mohelaLoans?.loans || [])) {
     const accountId = monarchMapping[loan.name];
     if (!accountId) continue;
     const balance = parseFloat((loan.currentBalance || '').replace(/ /g, ' ').replace(/[^0-9.]/g, ''));
     if (!balance || isNaN(balance)) continue;
+
+    // Backfill stagnant days with daily interest accrual before recording the
+    // new balance.  Uses the rate saved in Settings; skips silently if unset.
+    const annualRate = parseFloat(loanInterestRates?.[loan.name] ?? NaN);
+    if (!isNaN(annualRate) && annualRate > 0) {
+      statusEl.textContent = `Checking interest history for ${loan.name}…`;
+      try {
+        const result = await backfillLoanInterest(
+          csrfToken, accountId, loan.name, annualRate,
+          categories, monarchFingerprints, localSynced
+        );
+        backfillCreated += result.created;
+        backfillSkipped += result.skipped;
+      } catch (err) {
+        // Never let backfill failures block the main balance update
+        console.warn(`Interest backfill failed for "${loan.name}":`, err.message);
+      }
+    }
+
+    statusEl.textContent = 'Syncing…';
     try {
       const result = await monarchUpdateBalance(csrfToken, accountId, balance);
       const errs = result?.updateAccount?.errors;
@@ -835,11 +1100,12 @@ async function syncToMonarch() {
 
   // ── Build status line ───────────────────────────────────────────────────────
   const parts = [];
-  if (balancesOk)  parts.push(`✅ ${balancesOk} balance${balancesOk !== 1 ? 's' : ''} updated`);
-  if (balancesErr) parts.push(`❌ ${balancesErr} balance error${balancesErr !== 1 ? 's' : ''}`);
-  if (txOk)        parts.push(`✅ ${txOk} tx synced`);
-  if (txErr)       parts.push(`❌ ${txErr} tx error${txErr !== 1 ? 's' : ''}`);
-  if (txSkip)      parts.push(`⏭️ ${txSkip} skipped`);
+  if (balancesOk)      parts.push(`✅ ${balancesOk} balance${balancesOk !== 1 ? 's' : ''} updated`);
+  if (balancesErr)     parts.push(`❌ ${balancesErr} balance error${balancesErr !== 1 ? 's' : ''}`);
+  if (backfillCreated) parts.push(`📈 ${backfillCreated} interest day${backfillCreated !== 1 ? 's' : ''} backfilled`);
+  if (txOk)            parts.push(`✅ ${txOk} tx synced`);
+  if (txErr)           parts.push(`❌ ${txErr} tx error${txErr !== 1 ? 's' : ''}`);
+  if (txSkip)          parts.push(`⏭️ ${txSkip} skipped`);
 
   let statusText = parts.length ? parts.join('  ') : 'Nothing to sync.';
 
