@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Monarch Sync",
-  "version": "2.1",
+  "version": "2.3",
   "description": "Manually sync Mohela student loans and Prudential annuity balances directly to Monarch Money.",
   "permissions": ["activeTab", "scripting", "storage", "cookies", "declarativeNetRequestWithHostAccess"],
   "host_permissions": [
     "https://myaccount.mohela.studentaid.gov/*",
     "https://www.prudential.com/mypru/myaccounts/*",
     "https://myservice.prudential.com/*",
+    "https://api.nasdaq.com/*",
     "*://*.monarch.com/*",
     "*://*.monarchmoney.com/*"
   ],

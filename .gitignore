@@ -1,3 +1,46 @@
 .DS_Store
 _metadata/
 .claude/
+
+# Local/private financial exports and imports
+exports/
+imports/
+downloads/
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.ofx
+*.qfx
+*.qif
+
+# Saved institution pages and browser captures
+saved-pages/
+saved-html/
+browser-captures/
+*.har
+*Investment Allocation*.html
+*Account Activity*.html
+*Balance History*.html
+*MOHELA*.html
+*Mohela*.html
+*Prudential*.html
+*Fortitude*.html
+
+# Screenshots and debugging output
+screenshots/
+screen-shots/
+Screen Shot*.png
+Screenshot*.png
+*.screenshot.png
+*.log
+*.jsonl
+*.ndjson
+
+# Chrome extension/runtime storage dumps
+storage-dumps/
+chrome-storage/
+*chrome-storage*.json
+*storage-dump*.json
+*local-storage*.json
+*session-storage*.json

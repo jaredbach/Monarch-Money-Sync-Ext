@@ -199,6 +199,32 @@
     .data-display hr { border: none; border-top: 1px solid #efecea; margin: 5px 0; }
     .no-data         { color: #84827f; font-style: italic; font-size: 12px; }
 
+    .allocation-table-wrap {
+      overflow-x: auto; border: 1px solid #efecea; border-radius: 6px;
+      background: #fff;
+    }
+    .allocation-table {
+      width: 100%; min-width: 520px; border-collapse: collapse; font-size: 10px;
+    }
+    .allocation-table th,
+    .allocation-table td {
+      border-bottom: 1px solid #efecea; padding: 3px;
+      text-align: left; vertical-align: middle;
+    }
+    .allocation-table th { color: #84827f; font-weight: 700; background: #f6f5f3; }
+    .allocation-table .col-fund { width: 170px; }
+    .allocation-table .col-num { width: 58px; }
+    .allocation-table .col-proxy { width: 58px; }
+    .allocation-status {
+      min-height: 14px; margin-top: 5px; font-size: 10px; color: #84827f;
+      word-break: break-word;
+    }
+    .estimate-note {
+      color: #6f5b00; background: #fff9d7; border: 1px solid #eadc83;
+      border-radius: 6px; padding: 6px 7px; font-size: 10px; line-height: 1.35;
+      margin-top: 6px;
+    }
+
     /* ── Buttons ─────────────────────────────────────────────────────────── */
     button {
       width: 100%; margin-top: 6px; padding: 7px 10px;
@@ -338,6 +364,18 @@
       </div>
       <div id="pru-balance" class="data-display">
         <span class="no-data">No data. Visit the <a href="https://www.prudential.com/mypru/myaccounts/" target="_blank">My Accounts</a> page while logged in, then click Sync.</span>
+      </div>
+    </div>
+    <div class="source-card">
+      <div class="source-card-header">
+        <span class="source-badge badge-prudential">Allocation</span>
+        <small id="pru-allocation-summary" style="color:#84827f;font-size:10px;"></small>
+      </div>
+      <div id="pru-allocation-editor">
+        <span class="no-data">Open Prudential's Investment Allocation page, then click Sync Now to scrape allocations automatically.</span>
+      </div>
+      <div class="estimate-note">
+        Estimated Prudential history is non-official and proxy-derived. Actual synced balances are kept as anchors.
       </div>
     </div>
     <button id="sync-pru" class="btn-sync">&#8635; Sync Now</button>

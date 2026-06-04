@@ -1327,6 +1327,101 @@ async function backfillLoanInterest(csrfToken, accountId, loanName, annualRatePc
   return { balancesUpdated, balanceError };
 }
 
+async function requestBackgroundMessage(message) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(message, response => {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        reject(new Error(runtimeError.message));
+      } else if (!response?.ok) {
+        reject(new Error(response?.error || 'Background request failed'));
+      } else {
+        resolve(response.result);
+      }
+    });
+  });
+}
+
+async function backfillPrudentialBalanceEstimates(
+  csrfToken,
+  accountId,
+  account,
+  allocationSnapshots,
+  selectedAllocationSnapshotByAccount
+) {
+  const currentBalance = Math.abs(currentBalanceAmount(account.accountValue));
+  if (!currentBalance || !Number.isFinite(currentBalance)) {
+    return { balancesUpdated: 0, balanceError: null };
+  }
+
+  const today = localIsoDate();
+  const currentDate = parsePruDate(account.asOfDate) || today;
+  const lookbackStart = localIsoDateDaysAgo(60);
+  const history = await monarchFetchBalanceHistory(csrfToken, accountId, lookbackStart, today);
+  const knownByDate = new Map(history.map(row => [row.date, {
+    date: row.date,
+    balance: Math.abs(row.balance),
+    source: 'monarch-history',
+  }]));
+
+  knownByDate.set(currentDate, {
+    date: currentDate,
+    balance: currentBalance,
+    source: 'scraped-current',
+  });
+
+  const scrapedSnapshots = matchingScrapedAllocationSnapshots(allocationSnapshots, account, accountId, true);
+  const payload = {
+    accountId,
+    knownBalances: [...knownByDate.values()].sort((a, b) => a.date.localeCompare(b.date)),
+    allocationSnapshots: scrapedSnapshots.map(snapshot => ({ ...snapshot, accountId })),
+    selectedAllocationSnapshotId: null,
+    maxBackfillDays: 60,
+  };
+
+  const estimateResult = await requestBackgroundMessage({
+    type: 'PRU_BACKFILL_ESTIMATE',
+    payload,
+  });
+
+  const estimatedRows = (estimateResult?.rows || [])
+    .filter(row => row.estimated && isIsoDate(row.date) && Number.isFinite(row.balance))
+    .filter(row => row.date < currentDate);
+
+  if (!estimatedRows.length) {
+    console.log(`Prudential backfill "${account.name}": no estimated rows`, estimateResult?.debug);
+    if (/proxy price history unavailable/i.test(estimateResult?.debug?.reason || '')) {
+      return { balancesUpdated: 0, balanceError: estimateResult.debug.reason, debug: estimateResult.debug };
+    }
+    return { balancesUpdated: 0, balanceError: null, debug: estimateResult?.debug };
+  }
+
+  console.log(`Prudential backfill "${account.name}": uploading estimates`, estimatedRows);
+  const verified = await monarchUploadAndVerifyBalanceHistory(csrfToken, accountId, estimatedRows);
+  await persistPrudentialEstimateMetadata(accountId, account.name, estimatedRows);
+  return { balancesUpdated: verified.matched || estimatedRows.length, balanceError: null, debug: estimateResult?.debug };
+}
+
+async function persistPrudentialEstimateMetadata(accountId, sourceAccountName, rows) {
+  const { prudentialBalanceEstimates = [] } =
+    await chrome.storage.local.get('prudentialBalanceEstimates');
+  const replacementDates = new Set(rows.map(row => `${accountId}|${row.date}`));
+  const retained = prudentialBalanceEstimates.filter(row => !replacementDates.has(`${row.accountId}|${row.date}`));
+  const savedAt = new Date().toISOString();
+  await chrome.storage.local.set({
+    prudentialBalanceEstimates: [
+      ...retained,
+      ...rows.map(row => ({
+        ...row,
+        accountId,
+        sourceAccountName,
+        savedAt,
+        label: 'Estimated Prudential balance - proxy-derived, non-official',
+      })),
+    ],
+  });
+}
+
 /**
  * Return every calendar date strictly between startDate and endDate (inclusive),
  * i.e. [startDate+1 … endDate].  Both dates are "YYYY-MM-DD" strings.
@@ -1348,6 +1443,156 @@ function daysBetween(startDate, endDate) {
   const end = new Date(endDate + 'T00:00:00Z');
   if (isNaN(start.getTime()) || isNaN(end.getTime())) return 0;
   return Math.round((end - start) / 86400000);
+}
+
+function parsePruDate(value) {
+  const raw = normalizeText(value);
+  if (isIsoDate(raw)) return raw;
+  const m = raw.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  return m ? `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}` : '';
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function prudentialAccountStorageId(account, monarchMapping = {}) {
+  const key = `pru:${account?.name || ''}`;
+  return monarchMapping[key] || key;
+}
+
+function matchingScrapedAllocationSnapshots(allocationSnapshots, account, accountId, allowSingleFallback = false) {
+  const scraped = (allocationSnapshots || []).filter(snapshot => snapshot.source === 'scraped');
+  const matching = scraped.filter(snapshot =>
+    snapshot.accountId === accountId
+    || snapshot.accountId === `pru:${account?.name || ''}`
+    || snapshot.sourceAccountName === account?.name
+  );
+  if (matching.length || !allowSingleFallback) return matching;
+  return scraped.length === 1 ? scraped : [];
+}
+
+function normalizeAllocationSnapshotRows(rows) {
+  return (rows || [])
+    .map(row => ({
+      fundName: normalizeText(row.fundName),
+      weight: parseOptionalNumber(row.weight),
+      units: parseOptionalNumber(row.units),
+      contractPrice: parseOptionalNumber(row.contractPrice),
+      value: parseOptionalNumber(row.value),
+      proxySymbol: normalizeText(row.proxySymbol).toUpperCase(),
+      ftMorningstarId: normalizeText(row.ftMorningstarId),
+    }))
+    .filter(row => row.fundName || Number.isFinite(row.weight) || Number.isFinite(row.value));
+}
+
+function parseOptionalNumber(value) {
+  if (value === '' || value == null) return undefined;
+  const parsed = parseFloat(String(value).replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function allocationWeightTotal(rows) {
+  return rows.reduce((sum, row) => sum + (Number.isFinite(row.weight) ? row.weight : 0), 0);
+}
+
+function allocationWarningText(rows) {
+  const weightTotal = allocationWeightTotal(rows);
+  if (!rows.length) return 'No scraped allocation rows available for backfill.';
+  if (weightTotal === 0 && rows.some(row => Number.isFinite(row.value) && row.value > 0)) {
+    return 'Weights are blank; the backfill engine will derive weights from scraped values.';
+  }
+  if (Math.abs(weightTotal - 100) > 1) {
+    return `Weights total ${weightTotal.toFixed(2)}%; estimate confidence may be lower.`;
+  }
+  return `Weights total ${weightTotal.toFixed(2)}%.`;
+}
+
+async function renderPruAllocationEditor() {
+  const editor = document.getElementById('pru-allocation-editor');
+  const summary = document.getElementById('pru-allocation-summary');
+  if (!editor) return;
+
+  const {
+    prudentialAnnuity,
+    allocationSnapshots = [],
+    monarchMapping = {},
+  } = await chrome.storage.local.get([
+    'prudentialAnnuity',
+    'allocationSnapshots',
+    'monarchMapping',
+  ]);
+
+  const accounts = prudentialAnnuity?.accounts || [];
+  const account = accounts[0];
+  if (!account) {
+    editor.innerHTML = '<span class="no-data">No Prudential account data yet.</span>';
+    if (summary) summary.textContent = '';
+    return;
+  }
+
+  const accountId = prudentialAccountStorageId(account, monarchMapping);
+  const accountSnapshots = matchingScrapedAllocationSnapshots(allocationSnapshots, account, accountId, true)
+    .sort((a, b) =>
+      (b.effectiveDate || '').localeCompare(a.effectiveDate || '')
+      || (b.capturedAt || '').localeCompare(a.capturedAt || '')
+    );
+  const selected = accountSnapshots[0] || null;
+  const rows = normalizeAllocationSnapshotRows(selected?.rows || []);
+
+  if (summary) {
+    summary.textContent = accountSnapshots.length
+      ? `${accountSnapshots.length} scraped snapshot${accountSnapshots.length !== 1 ? 's' : ''}`
+      : 'Not scraped yet';
+  }
+
+  if (!selected || !rows.length) {
+    editor.innerHTML = '<span class="no-data">No scraped allocation yet. Open Prudential\'s Investment Allocation page, then click Sync Now.</span>';
+    return;
+  }
+
+  editor.innerHTML = `
+    <div class="allocation-status">
+      Last scraped ${escapeHtml(selected.effectiveDate || 'unknown date')}
+      ${selected.capturedAt ? ` · ${escapeHtml(new Date(selected.capturedAt).toLocaleString())}` : ''}
+    </div>
+    <div class="allocation-table-wrap">
+      <table class="allocation-table">
+        <thead>
+          <tr>
+            <th class="col-fund">Fund</th>
+            <th class="col-num">Weight %</th>
+            <th class="col-num">Units</th>
+            <th class="col-num">Price</th>
+            <th class="col-num">Value</th>
+            <th class="col-proxy">Proxy</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map(row => `
+            <tr>
+              <td>${escapeHtml(row.fundName || '')}</td>
+              <td>${escapeHtml(formatAllocationNumber(row.weight, 2))}</td>
+              <td>${escapeHtml(formatAllocationNumber(row.units, 5))}</td>
+              <td>${escapeHtml(formatAllocationNumber(row.contractPrice, 5))}</td>
+              <td>${escapeHtml(formatAllocationNumber(row.value, 2))}</td>
+              <td>${escapeHtml(row.proxySymbol || '')}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div class="allocation-status">${escapeHtml(allocationWarningText(rows))}</div>
+  `;
+}
+
+function formatAllocationNumber(value, decimals) {
+  return Number.isFinite(value) ? value.toFixed(decimals) : '';
 }
 
 // ─── Settings panel ────────────────────────────────────────────────────────────
@@ -1622,10 +1867,14 @@ async function syncToMonarch() {
     monarchMapping, monarchCategories,
     syncedTransactions: syncedRaw,
     loanInterestRates,
+    allocationSnapshots,
+    pruSelectedAllocationSnapshotByAccount,
   } = await chrome.storage.local.get([
     'mohelaLoans', 'prudentialAnnuity',
     'monarchMapping', 'monarchCategories', 'syncedTransactions',
     'loanInterestRates',
+    'allocationSnapshots',
+    'pruSelectedAllocationSnapshotByAccount',
   ]);
 
   // Re-fetch categories every sync so stale cached IDs never persist
@@ -1770,8 +2019,27 @@ async function syncToMonarch() {
   for (const acct of (prudentialAnnuity?.accounts || [])) {
     const accountId = monarchMapping[`pru:${acct.name}`];
     if (!accountId) continue;
-    const balance = parseFloat((acct.accountValue || '').replace(/[^0-9.]/g, ''));
-    if (!balance || isNaN(balance)) continue;
+    const balance = Math.abs(currentBalanceAmount(acct.accountValue));
+    if (!balance || !Number.isFinite(balance)) continue;
+    statusEl.textContent = `Checking estimated balance history for ${acct.name}…`;
+    try {
+      const result = await backfillPrudentialBalanceEstimates(
+        csrfToken,
+        accountId,
+        acct,
+        allocationSnapshots || [],
+        pruSelectedAllocationSnapshotByAccount || {}
+      );
+      backfillBalanceRows += result.balancesUpdated || 0;
+      if (result.balanceError) {
+        errors.push(`Prudential estimated balance history "${acct.name}": ${result.balanceError}`);
+      }
+    } catch (err) {
+      errors.push(`Prudential estimated balance history "${acct.name}": ${err.message}`);
+      console.warn(`Prudential estimated balance history failed for "${acct.name}":`, err.message);
+    }
+
+    statusEl.textContent = 'Syncing…';
     try {
       const result = await monarchUpdateBalance(csrfToken, accountId, balance, { isLiability: false });
       const errs = result?.updateAccount?.errors;
@@ -1919,26 +2187,31 @@ document.getElementById('sync-pru').addEventListener('click', async () => {
 
   statusEl.textContent = 'Syncing…';
 
+  // Listen before injection so fast allocation-page scrapes are not missed.
+  let receivedMessage = false;
+  const onDone = (msg) => {
+    if (!['pru_sync_done', 'pru_allocation_snapshot_saved', 'pru_allocation_snapshot_empty'].includes(msg?.type)) return;
+    receivedMessage = true;
+    if (msg.type === 'pru_allocation_snapshot_saved') {
+      statusEl.textContent = `Scraped and saved allocation snapshot (${msg.rowCount || 0} rows).`;
+    } else if (msg.type === 'pru_allocation_snapshot_empty') {
+      statusEl.textContent = 'No allocation rows found on the open Prudential page.';
+    } else {
+      statusEl.textContent = 'Prudential data refreshed.';
+    }
+    loadPrudentialData({ preserveStatus: true });
+  };
+  chrome.runtime.onMessage.addListener(onDone);
+
   for (const tab of tabs) {
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['pru_content.js'] });
   }
 
-  // Listen for completion message from content script (sent after all pages scraped)
-  let done = false;
-  const onDone = (msg) => {
-    if (msg?.type !== 'pru_sync_done') return;
-    done = true;
-    chrome.runtime.onMessage.removeListener(onDone);
-    loadPrudentialData();
-  };
-  chrome.runtime.onMessage.addListener(onDone);
-
   // Fallback: if message never arrives within 12 s, refresh anyway
   setTimeout(() => {
-    if (!done) {
-      chrome.runtime.onMessage.removeListener(onDone);
-      loadPrudentialData();
-    }
+    chrome.runtime.onMessage.removeListener(onDone);
+    if (!receivedMessage) statusEl.textContent = '';
+    loadPrudentialData({ preserveStatus: receivedMessage });
   }, 12000);
 });
 
@@ -1949,15 +2222,16 @@ function clearPruStatus() {
 
 // ─── Prudential display ────────────────────────────────────────────────────────
 
-async function loadPrudentialData() {
-  const { prudentialAnnuity } = await chrome.storage.local.get('prudentialAnnuity');
+async function loadPrudentialData({ preserveStatus = false } = {}) {
+  const { prudentialAnnuity, prudentialBalanceEstimates = [] } =
+    await chrome.storage.local.get(['prudentialAnnuity', 'prudentialBalanceEstimates']);
 
   const accounts = prudentialAnnuity?.accounts || [];
   const txCount  = (prudentialAnnuity?.transactions || []).length;
 
   // ── Set dot immediately ────────────────────────────────────────────────────
   setDot('pru', accounts.length ? 'green' : 'red');
-  clearPruStatus();
+  if (!preserveStatus) clearPruStatus();
 
   const el        = document.getElementById('pru-balance');
   const exportBtn = document.getElementById('export-pru');
@@ -1971,17 +2245,22 @@ async function loadPrudentialData() {
     el.innerHTML = prudentialAnnuity
       ? '<span class="no-data">No accounts found. Try Sync Now while on the My Accounts page.</span>'
       : '<span class="no-data">No data yet. Visit the Prudential pages while logged in.</span>';
+    await renderPruAllocationEditor();
     return;
   }
 
   if (asOfEl && accounts[0]?.asOfDate) asOfEl.textContent = `As of ${accounts[0].asOfDate}`;
 
+  const estimateCount = prudentialBalanceEstimates.length;
   el.innerHTML = accounts.map(a => `
     <div>
       <b>${a.name}</b><br>
       Account Value: <strong>${a.accountValue || 'N/A'}</strong>
     </div><hr>
-  `).join('') + `<div style="color:#888;font-size:11px;">${txCount} transaction${txCount !== 1 ? 's' : ''} loaded</div>`;
+  `).join('')
+    + `<div style="color:#888;font-size:11px;">${txCount} transaction${txCount !== 1 ? 's' : ''} loaded`
+    + `${estimateCount ? ` &nbsp;&middot;&nbsp; ${estimateCount} estimated balance row${estimateCount !== 1 ? 's' : ''} tracked locally` : ''}</div>`;
+  await renderPruAllocationEditor();
 }
 
 // ─── Prudential CSV exports ────────────────────────────────────────────────────
