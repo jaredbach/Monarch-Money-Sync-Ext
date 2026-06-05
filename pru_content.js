@@ -81,9 +81,13 @@
     if (!accounts.length) { console.warn('Prudential: no accounts found'); return; }
 
     const allocationSnapshot = scrapeAllocationSnapshot(accounts[0]);
+    const scrapedAt = new Date().toISOString();
 
     chrome.storage.local.get('prudentialAnnuity', ({ prudentialAnnuity }) => {
-      chrome.storage.local.set({ prudentialAnnuity: { ...(prudentialAnnuity || {}), accounts } });
+      chrome.storage.local.set({
+        prudentialAnnuity: { ...(prudentialAnnuity || {}), accounts, lastWebsiteSyncAt: scrapedAt },
+        prudentialLastWebsiteSyncAt: scrapedAt,
+      });
     });
 
     saveAllocationSnapshot(allocationSnapshot);
@@ -145,6 +149,7 @@
       );
       chrome.storage.local.set({
         allocationSnapshots: [...remaining, allocationSnapshot],
+        prudentialLastWebsiteSyncAt: allocationSnapshot.capturedAt || new Date().toISOString(),
       }, () => {
         chrome.runtime.sendMessage({
           type: 'pru_allocation_snapshot_saved',
@@ -397,9 +402,13 @@
     });
 
     console.log(`Pru tx total unique: ${unique.length}`);
+    const scrapedAt = new Date().toISOString();
     chrome.storage.local.get('prudentialAnnuity', ({ prudentialAnnuity }) => {
       chrome.storage.local.set(
-        { prudentialAnnuity: { ...(prudentialAnnuity || {}), transactions: unique } },
+        {
+          prudentialAnnuity: { ...(prudentialAnnuity || {}), transactions: unique, lastWebsiteSyncAt: scrapedAt },
+          prudentialLastWebsiteSyncAt: scrapedAt,
+        },
         () => {
           // Notify the popup that scraping is complete
           chrome.runtime.sendMessage({ type: 'pru_sync_done', count: unique.length });

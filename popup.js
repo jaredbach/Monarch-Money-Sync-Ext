@@ -2167,6 +2167,7 @@ document.getElementById('sync').addEventListener('click', async () => {
 
 const PRU_ACCOUNTS_URL     = 'https://www.prudential.com/mypru/myaccounts/';
 const PRU_TRANSACTIONS_URL = 'https://myservice.prudential.com/fliac1/s/pru-ann360-transactions';
+const PRU_ALLOCATION_URL   = 'https://myservice.prudential.com/fliac1/s/pru-ann360-investment-allocation';
 
 document.getElementById('sync-pru').addEventListener('click', async () => {
   // Use a dedicated status line — never overwrite the data card while syncing
@@ -2215,6 +2216,69 @@ document.getElementById('sync-pru').addEventListener('click', async () => {
   }, 12000);
 });
 
+document.getElementById('redo-pru-allocations').addEventListener('click', async () => {
+  const statusEl = document.getElementById('pru-sync-status');
+  const button = document.getElementById('redo-pru-allocations');
+
+  const tabs = await chrome.tabs.query({
+    url: ['https://myservice.prudential.com/fliac1/s/pru-ann360-investment-allocation*'],
+  });
+
+  if (tabs.length === 0) {
+    statusEl.innerHTML =
+      '&#9888; No open Prudential allocation tab found. '
+      + '<a href="' + PRU_ALLOCATION_URL + '" target="_blank">Open Investment Allocation &#8599;</a>'
+      + ' while logged in, then click Redo Allocations again.';
+    return;
+  }
+
+  if (!confirm('Clear saved Prudential allocation snapshots and local estimated-balance tracking, then rescrape the open allocation page?\n\nThis will NOT delete anything in Monarch Money.')) return;
+
+  button.disabled = true;
+  statusEl.textContent = 'Clearing saved allocations...';
+
+  let onDone = null;
+  try {
+    const { allocationSnapshots = [] } = await chrome.storage.local.get('allocationSnapshots');
+    await chrome.storage.local.set({
+      allocationSnapshots: allocationSnapshots.filter(snapshot => snapshot.source !== 'scraped'),
+      pruSelectedAllocationSnapshotByAccount: {},
+      prudentialBalanceEstimates: [],
+    });
+    await loadPrudentialData({ preserveStatus: true });
+
+    statusEl.textContent = 'Rescraping allocations...';
+    let receivedMessage = false;
+    onDone = (msg) => {
+      if (!['pru_allocation_snapshot_saved', 'pru_allocation_snapshot_empty'].includes(msg?.type)) return;
+      receivedMessage = true;
+      chrome.runtime.onMessage.removeListener(onDone);
+      button.disabled = false;
+      statusEl.textContent = msg.type === 'pru_allocation_snapshot_saved'
+        ? `Scraped and saved allocation snapshot (${msg.rowCount || 0} rows).`
+        : 'No allocation rows found on the open Prudential allocation page.';
+      loadPrudentialData({ preserveStatus: true });
+    };
+    chrome.runtime.onMessage.addListener(onDone);
+
+    for (const tab of tabs) {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['pru_content.js'] });
+    }
+
+    setTimeout(() => {
+      chrome.runtime.onMessage.removeListener(onDone);
+      if (receivedMessage) return;
+      button.disabled = false;
+      statusEl.textContent = 'Could not confirm allocation scrape. Make sure the allocation page is fully loaded, then try again.';
+      loadPrudentialData({ preserveStatus: true });
+    }, 12000);
+  } catch (err) {
+    if (onDone) chrome.runtime.onMessage.removeListener(onDone);
+    button.disabled = false;
+    statusEl.textContent = `Could not redo allocations: ${err.message}`;
+  }
+});
+
 function clearPruStatus() {
   const el = document.getElementById('pru-sync-status');
   if (el) el.textContent = '';
@@ -2223,8 +2287,15 @@ function clearPruStatus() {
 // ─── Prudential display ────────────────────────────────────────────────────────
 
 async function loadPrudentialData({ preserveStatus = false } = {}) {
-  const { prudentialAnnuity, prudentialBalanceEstimates = [] } =
-    await chrome.storage.local.get(['prudentialAnnuity', 'prudentialBalanceEstimates']);
+  const {
+    prudentialAnnuity,
+    prudentialBalanceEstimates = [],
+    prudentialLastWebsiteSyncAt,
+  } = await chrome.storage.local.get([
+    'prudentialAnnuity',
+    'prudentialBalanceEstimates',
+    'prudentialLastWebsiteSyncAt',
+  ]);
 
   const accounts = prudentialAnnuity?.accounts || [];
   const txCount  = (prudentialAnnuity?.transactions || []).length;
@@ -2245,17 +2316,23 @@ async function loadPrudentialData({ preserveStatus = false } = {}) {
     el.innerHTML = prudentialAnnuity
       ? '<span class="no-data">No accounts found. Try Sync Now while on the My Accounts page.</span>'
       : '<span class="no-data">No data yet. Visit the Prudential pages while logged in.</span>';
+    if (asOfEl) asOfEl.textContent = '';
     await renderPruAllocationEditor();
     return;
   }
 
-  if (asOfEl && accounts[0]?.asOfDate) asOfEl.textContent = `As of ${accounts[0].asOfDate}`;
+  if (asOfEl) {
+    asOfEl.textContent =
+      formatWebsiteSyncAt(prudentialLastWebsiteSyncAt || prudentialAnnuity.lastWebsiteSyncAt)
+      || 'Last synced unknown';
+  }
 
   const estimateCount = prudentialBalanceEstimates.length;
   el.innerHTML = accounts.map(a => `
     <div>
       <b>${a.name}</b><br>
       Account Value: <strong>${a.accountValue || 'N/A'}</strong>
+      ${a.asOfDate ? `<div style="color:#84827f;font-size:11px;">Account value as of ${escapeHtml(a.asOfDate)}</div>` : ''}
     </div><hr>
   `).join('')
     + `<div style="color:#888;font-size:11px;">${txCount} transaction${txCount !== 1 ? 's' : ''} loaded`
@@ -2393,10 +2470,21 @@ function setDot(source, status) {
     : 'Unknown';
 }
 
+function formatWebsiteSyncAt(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return `Last synced ${date.toLocaleDateString()} ${date.toLocaleTimeString([], {
+    hour: 'numeric',
+    minute: '2-digit',
+  })}`;
+}
+
 // ─── Load & display Mohela data ────────────────────────────────────────────────
 
 async function loadData() {
-  const { mohelaLoans } = await chrome.storage.local.get('mohelaLoans');
+  const { mohelaLoans, mohelaLastWebsiteSyncAt } =
+    await chrome.storage.local.get(['mohelaLoans', 'mohelaLastWebsiteSyncAt']);
 
   // ── Set dot immediately — don't block on CSRF/session checks ──────────────
   const hasStoredLoans = !!(mohelaLoans?.loans?.length);
@@ -2411,13 +2499,18 @@ async function loadData() {
 
   if (!mohelaLoans) {
     el.innerHTML = '<span class="no-data">No data. Navigate to your Mohela account and click Sync.</span>';
+    if (asOfEl) asOfEl.textContent = '';
     if (exportBtn) exportBtn.disabled = true;
     if (txBtn)     txBtn.disabled     = true;
   } else {
     const hasTx = !!(mohelaLoans.transactions?.length);
     if (exportBtn) exportBtn.disabled = !hasActiveLoans;
     if (txBtn)     txBtn.disabled     = !hasTx;
-    if (asOfEl) asOfEl.textContent = `As of ${new Date().toLocaleDateString()}`;
+    if (asOfEl) {
+      asOfEl.textContent =
+        formatWebsiteSyncAt(mohelaLastWebsiteSyncAt || mohelaLoans.lastWebsiteSyncAt)
+        || 'Last synced unknown';
+    }
 
     el.innerHTML = `
       <div style="margin-bottom:6px;">

@@ -219,10 +219,18 @@
       min-height: 14px; margin-top: 5px; font-size: 10px; color: #84827f;
       word-break: break-word;
     }
+    .allocation-actions {
+      display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+      min-width: 0;
+    }
+    .allocation-actions button {
+      width: auto; margin-top: 0; padding: 4px 8px; font-size: 10px;
+      white-space: nowrap;
+    }
     .estimate-note {
       color: #6f5b00; background: #fff9d7; border: 1px solid #eadc83;
       border-radius: 6px; padding: 6px 7px; font-size: 10px; line-height: 1.35;
-      margin-top: 6px;
+      margin-top: 10px;
     }
 
     /* ── Buttons ─────────────────────────────────────────────────────────── */
@@ -369,7 +377,12 @@
     <div class="source-card">
       <div class="source-card-header">
         <span class="source-badge badge-prudential">Allocation</span>
-        <small id="pru-allocation-summary" style="color:#84827f;font-size:10px;"></small>
+        <div class="allocation-actions">
+          <small id="pru-allocation-summary" style="color:#84827f;font-size:10px;"></small>
+          <button id="redo-pru-allocations" title="Clear saved allocations and scrape the open Prudential allocation page again">
+            Redo Allocations
+          </button>
+        </div>
       </div>
       <div id="pru-allocation-editor">
         <span class="no-data">Open Prudential's Investment Allocation page, then click Sync Now to scrape allocations automatically.</span>

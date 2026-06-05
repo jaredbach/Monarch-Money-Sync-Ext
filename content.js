@@ -129,7 +129,9 @@
     console.warn('Mohela Sync: transactions scraping failed', e);
   }
 
-  chrome.storage.local.set({ mohelaLoans: data }, () => {
+  data.lastWebsiteSyncAt = new Date().toISOString();
+
+  chrome.storage.local.set({ mohelaLoans: data, mohelaLastWebsiteSyncAt: data.lastWebsiteSyncAt }, () => {
     console.log("✅ Mohela loan data saved:", data);
   });
 })();
